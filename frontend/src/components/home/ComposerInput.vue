@@ -3,9 +3,9 @@
   <div class="composer-container">
     <!-- 输入区域 -->
     <div class="composer-input-wrapper">
-      <div class="search-icon-static">
+      <div class="search-icon-static" aria-hidden="true">
         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <path d="M21 21L16.65 16.65M19 11C19 15.4183 15.4183 19 11 19C6.58172 19 3 15.4183 3 11C3 6.58172 6.58172 3 11 3C15.4183 3 19 6.58172 19 11Z" stroke="#999" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M21 21L16.65 16.65M19 11C19 15.4183 15.4183 19 11 19C6.58172 19 3 15.4183 3 11C3 6.58172 6.58172 3 11 3C15.4183 3 19 6.58172 19 11Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
       </div>
       <textarea
@@ -13,10 +13,23 @@
         :value="modelValue"
         @input="handleInput"
         class="composer-textarea"
-        placeholder="输入主题，例如：秋季显白美甲..."
-        @keydown.enter.prevent="handleEnter"
+        aria-label="创作主题"
+        placeholder="输入主题，例如：使用 Codex 之前和之后的我"
         :disabled="loading"
         rows="1"
+      ></textarea>
+    </div>
+
+    <div class="creative-brief-wrapper">
+      <label for="creative-brief" class="creative-brief-label">补充创作要求 <span>（可选）</span></label>
+      <textarea
+        id="creative-brief"
+        :value="creativeBrief"
+        class="creative-brief-input"
+        placeholder="例如：前后反差夸张；画面优先，少文字；整体轻松幽默"
+        :disabled="loading"
+        rows="2"
+        @input="handleBriefInput"
       ></textarea>
     </div>
 
@@ -99,12 +112,14 @@ interface UploadedImage {
 // 定义 Props
 const props = defineProps<{
   modelValue: string
+  creativeBrief: string
   loading: boolean
 }>()
 
 // 定义 Emits
 const emit = defineEmits<{
   (e: 'update:modelValue', value: string): void
+  (e: 'update:creativeBrief', value: string): void
   (e: 'generate'): void
   (e: 'imagesChange', images: File[]): void
 }>()
@@ -125,11 +140,10 @@ function handleInput(event: Event) {
 }
 
 /**
- * 处理回车键
+ * 更新不作为标题保存的补充创作要求。
  */
-function handleEnter(e: KeyboardEvent) {
-  if (e.shiftKey) return // 允许 Shift+Enter 换行
-  emit('generate')
+function handleBriefInput(event: Event) {
+  emit('update:creativeBrief', (event.target as HTMLTextAreaElement).value)
 }
 
 /**
@@ -212,11 +226,11 @@ defineExpose({
 <style scoped>
 /* 组合框容器 */
 .composer-container {
-  background: white;
+  background: var(--bg-card);
   border-radius: 16px;
   padding: 16px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
-  border: 1px solid rgba(0, 0, 0, 0.06);
+  box-shadow: var(--shadow-md);
+  border: 1px solid var(--border-color);
 }
 
 /* 输入区域 */
@@ -229,7 +243,7 @@ defineExpose({
 .search-icon-static {
   flex-shrink: 0;
   padding-top: 8px;
-  color: #999;
+  color: var(--text-secondary);
 }
 
 .composer-textarea {
@@ -243,16 +257,63 @@ defineExpose({
   max-height: 200px;
   padding: 8px 0;
   font-family: inherit;
-  color: var(--text-main, #1a1a1a);
+  background: transparent;
+  color: var(--text-main);
 }
 
 .composer-textarea::placeholder {
-  color: #999;
+  color: var(--text-placeholder);
 }
 
 .composer-textarea:disabled {
   background: transparent;
-  color: #999;
+  color: var(--text-secondary);
+}
+
+.creative-brief-wrapper {
+  margin: 4px 0 0 36px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color, #eee);
+  border-radius: 10px;
+  background: var(--bg-subtle);
+  text-align: left;
+}
+
+.creative-brief-label {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--text-main);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.creative-brief-label span {
+  color: var(--text-sub);
+  font-weight: 400;
+}
+
+.creative-brief-input {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 44px;
+  padding: 0;
+  border: none;
+  outline: none;
+  resize: vertical;
+  background: transparent;
+  color: var(--text-main);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.creative-brief-input::placeholder {
+  color: var(--text-placeholder);
+}
+
+.creative-brief-input:disabled {
+  color: var(--text-secondary);
 }
 
 /* 已上传图片预览 */
@@ -262,7 +323,7 @@ defineExpose({
   gap: 12px;
   margin-top: 16px;
   padding: 16px;
-  background: #fafafa;
+  background: var(--bg-muted);
   border-radius: 12px;
   align-items: center;
 }
@@ -311,7 +372,7 @@ defineExpose({
 .upload-hint {
   flex: 1;
   font-size: 12px;
-  color: var(--text-sub, #666);
+  color: var(--text-sub);
   text-align: right;
 }
 
@@ -322,7 +383,7 @@ defineExpose({
   align-items: center;
   margin-top: 12px;
   padding-top: 12px;
-  border-top: 1px solid #f0f0f0;
+  border-top: 1px solid var(--border-subtle);
 }
 
 .toolbar-left {
@@ -338,21 +399,21 @@ defineExpose({
   width: 40px;
   height: 40px;
   border-radius: 10px;
-  background: #f5f5f5;
+  background: var(--bg-muted);
   border: none;
   cursor: pointer;
-  color: #666;
+  color: var(--text-sub);
   transition: all 0.2s;
 }
 
 .tool-btn:hover {
-  background: #eee;
-  color: var(--primary, #ff2442);
+  background: var(--surface-hover);
+  color: var(--primary);
 }
 
 .tool-btn.active {
-  background: rgba(255, 36, 66, 0.1);
-  color: var(--primary, #ff2442);
+  background: var(--primary-light);
+  color: var(--primary);
 }
 
 .badge-count {
@@ -392,8 +453,8 @@ defineExpose({
   margin-top: 12px;
   padding: 10px 12px;
   border-radius: 8px;
-  background: rgba(255, 36, 66, 0.06);
-  color: var(--text-sub, #666);
+  background: var(--primary-fade);
+  color: var(--text-sub);
   font-size: 14px;
   line-height: 1.5;
   text-align: right;

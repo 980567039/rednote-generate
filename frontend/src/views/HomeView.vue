@@ -21,6 +21,7 @@
       <ComposerInput
         ref="composerRef"
         v-model="topic"
+        v-model:creative-brief="creativeBrief"
         :loading="loading"
         @generate="handleGenerate"
         @imagesChange="handleImagesChange"
@@ -100,6 +101,7 @@ const store = useGeneratorStore()
 
 // 状态
 const topic = ref('')
+const creativeBrief = ref('')
 const loading = ref(false)
 const error = ref<AppError | null>(null)
 const composerRef = ref<InstanceType<typeof ComposerInput> | null>(null)
@@ -164,9 +166,11 @@ function selectTrend(selectedTopic: string) {
   topic.value = selectedTopic
 }
 
-function topicForSelectedStructure(rawTopic: string) {
+function topicForSelectedStructure(rawTopic: string, brief: string) {
   const preset = structurePresets.find(item => item.id === selectedStructure.value)
-  return `${rawTopic}\n\n【创作结构要求】${preset?.instruction || structurePresets[0].instruction}`
+  const creativeBrief = brief.trim()
+  const briefInstruction = creativeBrief ? `\n\n【补充创作要求】${creativeBrief}` : ''
+  return `${rawTopic}${briefInstruction}\n\n【创作结构要求】${preset?.instruction || structurePresets[0].instruction}`
 }
 
 onMounted(loadTrends)
@@ -195,7 +199,7 @@ async function handleGenerate() {
 
     const rawTopic = topic.value.trim()
     const result = await generateOutline(
-      topicForSelectedStructure(rawTopic),
+      topicForSelectedStructure(rawTopic, creativeBrief.value),
       imageFiles.length > 0 ? imageFiles : undefined
     )
 
@@ -266,9 +270,9 @@ async function handleGenerate() {
   margin-bottom: 40px;
   padding: 50px 60px;
   animation: fadeIn 0.6s ease-out;
-  background: rgba(255, 255, 255, 0.95);
+  background: var(--bg-card);
   border-radius: 24px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.06);
+  box-shadow: var(--shadow-md);
   backdrop-filter: blur(10px);
 }
 
