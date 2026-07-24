@@ -98,6 +98,22 @@ export interface Config {
   }
 }
 
+export interface TrendItem {
+  rank: number
+  title: string
+  category: string
+  topic: string
+}
+
+export interface TrendsResponse {
+  success: boolean
+  source: 'local_demo' | string
+  updated_at: string
+  trends: TrendItem[]
+  error?: AppError | string
+  error_message?: string
+}
+
 export interface ContentResponse {
   success: boolean
   titles?: string[]

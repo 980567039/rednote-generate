@@ -101,6 +101,14 @@ def test_default_image_prompts_prioritize_visuals_and_limit_tutorial_text():
         assert "≤10" in rendered or "10 个汉字" in rendered
 
 
+def test_outline_prompt_allows_explicit_no_cover_structure():
+    prompt_path = Path(__file__).parent.parent / "backend" / "prompts" / "outline_prompt.txt"
+    prompt = prompt_path.read_text(encoding="utf-8")
+
+    assert "明确要求“不生成封面”" in prompt
+    assert "严格按其页数和页面结构执行" in prompt
+
+
 def test_cached_generation_events_do_not_call_generator(tmp_path):
     service = make_history_service(tmp_path)
     record_id = service.create_record("topic", {
