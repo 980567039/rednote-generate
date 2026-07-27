@@ -60,6 +60,22 @@ def test_merge_generated_image_is_index_aligned(tmp_path):
     assert record["thumbnail"] == "2.png"
 
 
+def test_merge_generated_image_ignores_late_result_from_previous_task(tmp_path):
+    service = make_history_service(tmp_path)
+    record_id = service.create_record("topic", {
+        "pages": [{"index": 0, "type": "cover", "content": "cover"}],
+    })
+    assert service.begin_generation(record_id, "task_current")
+
+    assert not service.merge_generated_image(
+        record_id, "task_previous", 0, "0.png", total_count=1
+    )
+
+    record = service.get_record(record_id)
+    assert record["images"] == {"task_id": "task_current", "generated": []}
+    assert record["status"] == "generating"
+
+
 def test_restart_recovers_generating_record_without_resubmitting(tmp_path):
     service = make_history_service(tmp_path)
     record_id = service.create_record("topic", {
@@ -261,6 +277,42 @@ def test_prepare_generation_binds_record_and_rejects_duplicate(tmp_path):
         assert exc.state["status"] == "queued"
     else:
         raise AssertionError("重复活动任务应被拒绝")
+
+
+def test_force_generation_creates_fresh_task_and_clears_old_images(tmp_path):
+    history = make_history_service(tmp_path)
+    old_pages = [
+        {"index": 0, "type": "cover", "content": "old cover"},
+        {"index": 1, "type": "content", "content": "old content"},
+    ]
+    record_id = history.create_record("topic", {"pages": old_pages})
+    assert history.update_record(
+        record_id,
+        images={"task_id": "task_previous", "generated": ["0.png", "1.png"]},
+        status="completed",
+        thumbnail="0.png",
+    )
+    (tmp_path / "task_previous").mkdir()
+    (tmp_path / "task_previous" / "0.png").write_bytes(b"old")
+
+    # 模拟编辑页数后的强制重生成；即使请求仍带着旧 task_id，也必须新建任务。
+    edited_pages = old_pages + [
+        {"index": 2, "type": "summary", "content": "new summary"},
+    ]
+    image_service = make_image_service(tmp_path, history)
+    reservation = image_service.prepare_generation(
+        edited_pages,
+        task_id="task_previous",
+        record_id=record_id,
+        force=True,
+    )
+
+    assert reservation["task_id"] != "task_previous"
+    assert image_service.get_task_state(reservation["task_id"])["generated"] == {}
+    record = history.get_record(record_id)
+    assert record["images"] == {"task_id": reservation["task_id"], "generated": []}
+    assert record["status"] == "generating"
+    assert (tmp_path / "task_previous" / "0.png").exists()
 
 
 def test_all_failed_generation_finishes_task_and_history_as_error(tmp_path):

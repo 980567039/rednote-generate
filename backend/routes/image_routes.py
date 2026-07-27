@@ -336,6 +336,7 @@ def create_image_blueprint():
         - use_reference: 是否使用参考图（默认 true）
         - full_outline: 完整大纲文本（用于上下文）
         - user_topic: 用户原始输入主题
+        - revision_request: 本次重绘的补充修改意见（可选）
 
         返回：
         - success: 是否成功
@@ -349,6 +350,10 @@ def create_image_blueprint():
             full_outline = data.get('full_outline', '')
             user_topic = data.get('user_topic', '')
             record_id = data.get('record_id')
+            revision_request = data.get('revision_request', '')
+            if not isinstance(revision_request, str):
+                revision_request = ''
+            revision_request = revision_request.strip()[:500]
 
             log_request('/regenerate', {
                 'task_id': task_id,
@@ -369,7 +374,8 @@ def create_image_blueprint():
                 task_id, page, use_reference,
                 full_outline=full_outline,
                 user_topic=user_topic,
-                record_id=record_id
+                record_id=record_id,
+                revision_request=revision_request
             )
 
             if result["success"]:

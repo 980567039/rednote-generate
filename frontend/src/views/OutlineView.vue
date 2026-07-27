@@ -10,14 +10,27 @@
         </p>
       </div>
       <div style="display: flex; gap: 12px;">
-        <button class="btn btn-secondary" @click="goBack" style="background: white; border: 1px solid var(--border-color);">
+        <button class="btn btn-secondary outline-back-btn" @click="goBack">
           上一步
+        </button>
+        <button
+          v-if="hasExistingImages"
+          class="btn btn-secondary"
+          type="button"
+          @click="viewCurrentResult"
+        >
+          查看当前成品
         </button>
         <button class="btn btn-primary" @click="startGeneration">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 6px;"><path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z"></path><line x1="16" y1="8" x2="2" y2="22"></line><line x1="17.5" y1="15" x2="9" y2="15"></line></svg>
-          开始生成图片
+          {{ hasExistingImages ? '重新生成图片' : '开始生成图片' }}
         </button>
       </div>
+    </div>
+
+    <div v-if="hasExistingImages" class="existing-result-notice">
+      <strong>当前成品图片已保留。</strong>
+      修改大纲不会自动修改已有图片；你可以先查看当前成品，确认修改后再重新生成全部图片。
     </div>
 
     <div class="outline-grid">
@@ -72,7 +85,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useGeneratorStore } from '../stores/generator'
 import { updateHistory, createHistory } from '../api'
@@ -84,6 +97,7 @@ const dragOverIndex = ref<number | null>(null)
 const draggedIndex = ref<number | null>(null)
 // 保存状态指示
 const isSaving = ref(false)
+const hasExistingImages = computed(() => store.images.some(image => image.status === 'done' && Boolean(image.url)))
 
 const getPageTypeName = (type: string) => {
   const names = {
@@ -141,7 +155,19 @@ const startGeneration = async () => {
     saveTimer = null
     await autoSaveOutline()
   }
+  if (hasExistingImages.value) {
+    store.requestFreshImageGeneration()
+  }
   router.push('/generate')
+}
+
+const viewCurrentResult = async () => {
+  if (saveTimer !== null) {
+    clearTimeout(saveTimer)
+    saveTimer = null
+    await autoSaveOutline()
+  }
+  router.push('/result')
 }
 
 // ==================== 自动保存功能 ====================
@@ -291,6 +317,28 @@ watch(
 </script>
 
 <style scoped>
+.outline-back-btn {
+  border: 1px solid var(--border-color);
+  background: var(--bg-control);
+  color: var(--text-main);
+}
+
+.existing-result-notice {
+  max-width: 1160px;
+  margin: -12px auto 24px;
+  padding: 12px 16px;
+  border: 1px solid color-mix(in srgb, var(--primary) 24%, var(--border-color));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--primary) 7%, var(--bg-card));
+  color: var(--text-sub);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.existing-result-notice strong {
+  color: var(--text-main);
+}
+
 /* 保存状态指示器 */
 .save-indicator {
   margin-left: 12px;
@@ -332,7 +380,7 @@ watch(
   transition: all 0.2s ease;
   border: none;
   border-radius: 8px; /* 较小的圆角 */
-  background: white;
+  background: var(--bg-card);
   box-shadow: 0 2px 8px rgba(0,0,0,0.04);
   /* 保持一定的长宽比感，虽然高度自适应，但由于 flex column 和内容撑开，
      这里设置一个 min-height 让它看起来像个竖向卡片 */

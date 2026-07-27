@@ -70,6 +70,13 @@ export interface HistoryDetail {
     task_id: string | null
     generated: string[]
   }
+  content?: {
+    titles: string[]
+    copywriting: string
+    tags: string[]
+    status: 'idle' | 'generating' | 'done' | 'error'
+    error?: string
+  }
   status: string
   thumbnail: string | null
 }
@@ -83,6 +90,13 @@ export interface CreateHistoryParams {
 export interface UpdateHistoryParams {
   outline?: { raw: string; pages: Page[] }
   images?: { task_id: string | null; generated: string[] }
+  content?: {
+    titles: string[]
+    copywriting: string
+    tags: string[]
+    status?: 'idle' | 'generating' | 'done' | 'error'
+    error?: string
+  }
   status?: string
   thumbnail?: string
 }

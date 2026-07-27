@@ -25,6 +25,7 @@ export async function regenerateImage(
     fullOutline?: string
     userTopic?: string
     recordId?: string | null
+    revisionRequest?: string
   }
 ): Promise<{ success: boolean; index: number; image_url?: string; error?: AppError | string; error_message?: string }> {
   const response = await axios.post(`${API_BASE_URL}/regenerate`, {
@@ -33,7 +34,8 @@ export async function regenerateImage(
     use_reference: useReference,
     full_outline: context?.fullOutline,
     user_topic: context?.userTopic,
-    record_id: context?.recordId || undefined
+    record_id: context?.recordId || undefined,
+    revision_request: context?.revisionRequest || undefined
   })
   return response.data
 }

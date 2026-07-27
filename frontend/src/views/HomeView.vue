@@ -14,7 +14,32 @@
           让传播不再需要门槛，让创作从未如此简单
         </div>
         <h1 class="page-title">灵感一触即发</h1>
-        <p class="page-subtitle">输入你的创意主题，让 AI 帮你生成爆款标题、正文和封面图</p>
+        <p class="page-subtitle">{{ modeDescription }}</p>
+      </div>
+
+      <div class="creation-mode-selector" role="group" aria-label="创作类型">
+        <button
+          type="button"
+          class="creation-mode-option"
+          :class="{ active: creationMode === 'free' }"
+          :aria-pressed="creationMode === 'free'"
+          :disabled="loading"
+          @click="creationMode = 'free'"
+        >
+          <span>自由创作</span>
+          <small>适合观点、教程和对比内容</small>
+        </button>
+        <button
+          type="button"
+          class="creation-mode-option"
+          :class="{ active: creationMode === 'travel' }"
+          :aria-pressed="creationMode === 'travel'"
+          :disabled="loading"
+          @click="creationMode = 'travel'"
+        >
+          <span>旅游攻略</span>
+          <small>按目的地生成游览路线</small>
+        </button>
       </div>
 
       <!-- 主题输入组合框 -->
@@ -23,11 +48,50 @@
         v-model="topic"
         v-model:creative-brief="creativeBrief"
         :loading="loading"
+        :placeholder="composerPlaceholder"
+        :topic-label="creationMode === 'travel' ? '旅游目的地' : '创作主题'"
         @generate="handleGenerate"
         @imagesChange="handleImagesChange"
       />
 
-      <div class="structure-selector" role="group" aria-label="页数与创作结构">
+      <div v-if="creationMode === 'travel'" class="travel-options">
+        <div class="travel-option-group">
+          <label for="travel-duration">游玩时长</label>
+          <select id="travel-duration" v-model="travelDuration" :disabled="loading">
+            <option value="half_day">半天</option>
+            <option value="one_day">一天</option>
+            <option value="two_days">两天</option>
+          </select>
+        </div>
+        <div class="travel-option-group">
+          <label for="travel-party">同行人群</label>
+          <select id="travel-party" v-model="travelParty" :disabled="loading">
+            <option value="第一次到访">第一次到访</option>
+            <option value="亲子出游">亲子出游</option>
+            <option value="情侣出游">情侣出游</option>
+            <option value="独自旅行">独自旅行</option>
+            <option value="老人同行">老人同行</option>
+          </select>
+        </div>
+        <div class="travel-preferences" role="group" aria-label="旅行偏好">
+          <span class="travel-preferences-label">旅行偏好</span>
+          <button
+            v-for="preference in travelPreferenceOptions"
+            :key="preference"
+            type="button"
+            class="travel-preference-chip"
+            :class="{ active: travelPreferences.includes(preference) }"
+            :aria-pressed="travelPreferences.includes(preference)"
+            :disabled="loading"
+            @click="toggleTravelPreference(preference)"
+          >
+            {{ preference }}
+          </button>
+        </div>
+        <p class="travel-data-notice">当前为本地体验版，开放时间、票务、预约和临时关闭信息请以景点官方最新公告为准。</p>
+      </div>
+
+      <div v-if="creationMode === 'free'" class="structure-selector" role="group" aria-label="页数与创作结构">
         <span class="structure-label">页数与结构</span>
         <button
           v-for="preset in structurePresets"
@@ -106,8 +170,15 @@ const loading = ref(false)
 const error = ref<AppError | null>(null)
 const composerRef = ref<InstanceType<typeof ComposerInput> | null>(null)
 type StructurePresetId = 'standard' | 'comparison_two' | 'comparison_four'
+type CreationMode = 'free' | 'travel'
+type TravelDuration = 'half_day' | 'one_day' | 'two_days'
 
+const creationMode = ref<CreationMode>('free')
 const selectedStructure = ref<StructurePresetId>('standard')
+const travelDuration = ref<TravelDuration>('one_day')
+const travelParty = ref('第一次到访')
+const travelPreferences = ref<string[]>(['拍照出片', '少走回头路'])
+const travelPreferenceOptions = ['拍照出片', '历史文化', '当地美食', '少走路', '避开人群', '亲子友好']
 const structurePresets: Array<{
   id: StructurePresetId
   label: string
@@ -138,6 +209,14 @@ const trendLoading = ref(true)
 const trendPage = ref(0)
 const trendPageSize = 3
 
+const modeDescription = computed(() => creationMode.value === 'travel'
+  ? '输入目的地和旅行偏好，让 AI 规划适合发布的小红书旅游攻略'
+  : '输入你的创意主题，让 AI 帮你生成标题、正文和配图')
+
+const composerPlaceholder = computed(() => creationMode.value === 'travel'
+  ? '输入目的地，例如：北京故宫、杭州西湖、上海迪士尼'
+  : '输入主题，例如：使用 Codex 之前和之后的我')
+
 const displayedTrends = computed(() => {
   if (trends.value.length === 0) return []
   const start = (trendPage.value * trendPageSize) % trends.value.length
@@ -163,14 +242,46 @@ function showNextTrends() {
 }
 
 function selectTrend(selectedTopic: string) {
+  creationMode.value = 'free'
   topic.value = selectedTopic
 }
 
-function topicForSelectedStructure(rawTopic: string, brief: string) {
+function toggleTravelPreference(preference: string) {
+  const index = travelPreferences.value.indexOf(preference)
+  if (index >= 0) {
+    travelPreferences.value.splice(index, 1)
+  } else {
+    travelPreferences.value.push(preference)
+  }
+}
+
+function topicForGeneration(rawInput: string, brief: string) {
+  if (creationMode.value === 'travel') {
+    const durationLabels: Record<TravelDuration, string> = {
+      half_day: '半天',
+      one_day: '一天',
+      two_days: '两天'
+    }
+    const structureInstructions: Record<TravelDuration, string> = {
+      half_day: '严格生成 5 页：第 1 页封面与路线总览；第 2 页出发前准备与交通；第 3 页前半程路线；第 4 页后半程路线；第 5 页拍照、休息、避坑与官方信息核验提醒。',
+      one_day: '严格生成 6 页：第 1 页封面与路线总览；第 2 页出发前准备、预约与交通；第 3 页上午路线；第 4 页下午路线；第 5 页拍照点、休息点和避坑提示；第 6 页时间表、总结与官方信息核验提醒。',
+      two_days: '严格生成 7 页：第 1 页封面与两日路线总览；第 2 页出发前准备、住宿区域与交通；第 3 页第一天上午路线；第 4 页第一天下午路线；第 5 页第二天上午路线；第 6 页第二天下午路线；第 7 页拍照、休息、避坑、总结与官方信息核验提醒。'
+    }
+    const preferences = travelPreferences.value.length > 0
+      ? travelPreferences.value.join('、')
+      : '无特别偏好'
+    const extraRequirement = brief.trim() ? `\n【补充要求】${brief.trim()}` : ''
+    return `请为目的地“${rawInput}”生成一篇适合发布到小红书的旅游攻略。\n\n` +
+      `【旅行条件】游玩时长：${durationLabels[travelDuration.value]}；同行人群：${travelParty.value}；旅行偏好：${preferences}。${extraRequirement}\n\n` +
+      `【路线要求】按实际游览顺序规划路线，尽量少走回头路；使用“地点 A → 地点 B → 地点 C”的清晰路线表达，并给出合理的时间段、停留建议、拍照或休息提示。不要编造无法确认的入口、交通班次、票价或强制规则。\n\n` +
+      `【页面结构】${structureInstructions[travelDuration.value]}不添加额外页面。\n\n` +
+      `【可靠性要求】无法确定或可能变化的开放时间、门票、预约、交通和临时关闭信息，必须明确写“请以官方最新信息为准”，不得把推测写成实时事实。`
+  }
+
   const preset = structurePresets.find(item => item.id === selectedStructure.value)
   const creativeBrief = brief.trim()
   const briefInstruction = creativeBrief ? `\n\n【补充创作要求】${creativeBrief}` : ''
-  return `${rawTopic}${briefInstruction}\n\n【创作结构要求】${preset?.instruction || structurePresets[0].instruction}`
+  return `${rawInput}${briefInstruction}\n\n【创作结构要求】${preset?.instruction || structurePresets[0].instruction}`
 }
 
 onMounted(loadTrends)
@@ -197,22 +308,30 @@ async function handleGenerate() {
   try {
     const imageFiles = uploadedImageFiles.value
 
-    const rawTopic = topic.value.trim()
+    const rawInput = topic.value.trim()
+    const workTitle = creationMode.value === 'travel' && !rawInput.includes('攻略')
+      ? `${rawInput}旅游攻略`
+      : rawInput
     const result = await generateOutline(
-      topicForSelectedStructure(rawTopic, creativeBrief.value),
+      topicForGeneration(rawInput, creativeBrief.value),
       imageFiles.length > 0 ? imageFiles : undefined
     )
 
     if (result.success && result.pages) {
-      // 设置主题和大纲到 store
-      store.setTopic(rawTopic)
-      store.setOutline(result.outline || '', result.pages)
+      // 原子切换作品，不能沿用上一次作品的正文、图片或任务状态。
+      store.beginNewWork(
+        workTitle,
+        result.outline || '',
+        result.pages,
+        imageFiles
+      )
+      const workVersion = store.workVersion
 
       // 大纲生成成功后，立即创建历史记录
       // 这样即使用户刷新页面或关闭浏览器，大纲也不会丢失
       try {
         const historyResult = await createHistory(
-          rawTopic,
+          workTitle,
           {
             raw: result.outline || '',
             pages: result.pages
@@ -220,9 +339,9 @@ async function handleGenerate() {
         )
 
         // 保存历史记录 ID 到 store，后续生成正文和图片时会使用
-        if (historyResult.success && historyResult.record_id) {
+        if (historyResult.success && historyResult.record_id && store.isCurrentWork(workVersion)) {
           store.setRecordId(historyResult.record_id)
-        } else {
+        } else if (store.isCurrentWork(workVersion)) {
           // 创建历史记录失败，记录错误但不阻断流程
           console.error('创建历史记录失败:', historyResult.error || '未知错误')
           store.setRecordId(null)
@@ -230,14 +349,7 @@ async function handleGenerate() {
       } catch (err: any) {
         // 创建历史记录异常，记录错误但不阻断流程
         console.error('创建历史记录异常:', err.message || err)
-        store.setRecordId(null)
-      }
-
-      // 保存用户上传的图片到 store
-      if (imageFiles.length > 0) {
-        store.userImages = imageFiles
-      } else {
-        store.userImages = []
+        if (store.isCurrentWork(workVersion)) store.setRecordId(null)
       }
 
       // 清理 ComposerInput 的预览
@@ -369,6 +481,128 @@ async function handleGenerate() {
   width: min(720px, calc(100vw - 32px));
   z-index: 1000;
   animation: slideUp 0.3s ease-out;
+}
+
+.creation-mode-selector {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  width: min(100%, 560px);
+  margin: 0 auto 14px;
+}
+
+.creation-mode-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 10px 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: var(--bg-card);
+  color: var(--text-main);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition: border-color 0.2s ease, background 0.2s ease, color 0.2s ease;
+}
+
+.creation-mode-option small {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.creation-mode-option:hover:not(:disabled),
+.creation-mode-option.active {
+  border-color: var(--primary);
+  background: var(--primary-light);
+  color: var(--primary);
+}
+
+.creation-mode-option:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+
+.travel-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+  padding: 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 14px;
+  background: var(--bg-subtle);
+  text-align: left;
+}
+
+.travel-option-group {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.travel-option-group label,
+.travel-preferences-label {
+  color: var(--text-main);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.travel-option-group select {
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 9px;
+  outline: none;
+  background: var(--bg-control);
+  color: var(--text-main);
+  font: inherit;
+  font-size: 14px;
+}
+
+.travel-option-group select:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-fade);
+}
+
+.travel-preferences {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.travel-preferences-label {
+  margin-right: 3px;
+}
+
+.travel-preference-chip {
+  padding: 6px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: var(--bg-control);
+  color: var(--text-sub);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+
+.travel-preference-chip:hover:not(:disabled),
+.travel-preference-chip.active {
+  border-color: var(--primary);
+  background: var(--primary-light);
+  color: var(--primary);
+}
+
+.travel-data-notice {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .structure-selector {
@@ -534,6 +768,10 @@ async function handleGenerate() {
 @media (max-width: 760px) {
   .trend-grid { grid-template-columns: 1fr; }
   .inspiration-section { padding: 18px; }
+  .creation-mode-selector,
+  .travel-options { grid-template-columns: 1fr; }
+  .travel-preferences,
+  .travel-data-notice { grid-column: 1; }
   .structure-selector { justify-content: flex-start; }
   .structure-label { width: 100%; }
   .structure-option { flex: 1 1 140px; }

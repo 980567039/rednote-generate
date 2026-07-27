@@ -33,7 +33,8 @@ export function useGenerationRunner(
         return
       }
 
-      if (await restoreFromHistory() || !isCurrentRun()) return
+      const force = store.consumeFreshImageGeneration()
+      if ((!force && await restoreFromHistory()) || !isCurrentRun()) return
 
       await ensureRecord()
       if (!isCurrentRun()) return
@@ -137,7 +138,7 @@ export function useGenerationRunner(
         store.userImages.length > 0 ? store.userImages : undefined,
         store.topic,
         store.recordId,
-        false,
+        force,
         abortController.signal
       )
     })().finally(() => {

@@ -39,6 +39,12 @@ export interface GeneratedContent {
 }
 
 export interface GeneratorState {
+  // 当前作品的内存会话版本。每次新建或加载作品时递增，用于丢弃旧请求的迟到响应。
+  workVersion: number
+
+  // 从已有成品进入图片重生成时使用的一次性标记，不写入 localStorage。
+  forceNextImageGeneration: boolean
+
   // 当前阶段：input-输入主题, outline-编辑大纲, generating-生成中, result-查看结果
   stage: 'input' | 'outline' | 'generating' | 'result'
 
@@ -82,6 +88,43 @@ export interface GeneratorState {
   lastSavedAt: string | null
 }
 
+export interface WorkReplacement {
+  topic: string
+  outline: {
+    raw: string
+    pages: Page[]
+  }
+  recordId: string | null
+  taskId?: string | null
+  images?: GeneratedImage[]
+  progress?: GeneratorState['progress']
+  stage?: GeneratorState['stage']
+  content?: {
+    titles: string[]
+    copywriting: string
+    tags: string[]
+    status?: GeneratedContent['status']
+    error?: string
+  }
+}
+
+function createEmptyProgress(): GeneratorState['progress'] {
+  return {
+    current: 0,
+    total: 0,
+    status: 'idle'
+  }
+}
+
+function createEmptyContent(): GeneratedContent {
+  return {
+    titles: [],
+    copywriting: '',
+    tags: [],
+    status: 'idle'
+  }
+}
+
 const STORAGE_KEY = 'generator-state'
 
 // 从 localStorage 加载状态
@@ -123,6 +166,11 @@ export const useGeneratorStore = defineStore('generator', {
   state: (): GeneratorState => {
     const saved = loadState()
     return {
+      // 不持久化会话版本；刷新后没有未完成的前端请求需要接收。
+      workVersion: 0,
+
+      forceNextImageGeneration: false,
+
       // 当前阶段
       stage: saved.stage || 'input',
 
@@ -136,11 +184,7 @@ export const useGeneratorStore = defineStore('generator', {
       },
 
       // 图片生成进度
-      progress: saved.progress || {
-        current: 0,
-        total: 0,
-        status: 'idle'
-      },
+      progress: saved.progress || createEmptyProgress(),
 
       // 生成的图片结果
       images: saved.images || [],
@@ -155,12 +199,7 @@ export const useGeneratorStore = defineStore('generator', {
       userImages: [],
 
       // 生成的内容数据
-      content: saved.content || {
-        titles: [],
-        copywriting: '',
-        tags: [],
-        status: 'idle'
-      },
+      content: saved.content || createEmptyContent(),
 
       // 大纲生成状态
       outlineStatus: saved.outlineStatus || 'idle',
@@ -171,6 +210,73 @@ export const useGeneratorStore = defineStore('generator', {
   },
 
   actions: {
+    /**
+     * 原子地切换到一件新作品。
+     *
+     * 大纲、图片、任务、正文和历史 ID 必须属于同一件作品；因此不能仅调用
+     * setTopic/setOutline，否则上一件作品的数据会被错误地显示或写回。
+     */
+    beginNewWork(topic: string, raw: string, pages: Page[], userImages: File[] = []) {
+      this.workVersion++
+      this.forceNextImageGeneration = false
+      this.stage = 'outline'
+      this.topic = topic
+      this.outline = { raw, pages }
+      this.progress = createEmptyProgress()
+      this.images = []
+      this.taskId = null
+      this.recordId = null
+      this.userImages = userImages
+      this.content = createEmptyContent()
+      this.outlineStatus = 'done'
+      this.lastSavedAt = null
+    },
+
+    /**
+     * 使用完整快照加载历史作品，避免新旧图片、任务和正文混用。
+     */
+    replaceWork(work: WorkReplacement) {
+      this.workVersion++
+      this.forceNextImageGeneration = false
+      this.topic = work.topic
+      this.outline = work.outline
+      this.recordId = work.recordId
+      this.taskId = work.taskId || null
+      this.images = work.images || []
+      this.progress = work.progress || createEmptyProgress()
+      this.stage = work.stage || 'outline'
+      this.userImages = []
+      this.content = work.content
+        ? {
+            titles: [...work.content.titles],
+            copywriting: work.content.copywriting,
+            tags: [...work.content.tags],
+            status: work.content.status || (
+              work.content.titles.length > 0 || work.content.copywriting || work.content.tags.length > 0
+                ? 'done'
+                : 'idle'
+            ),
+            error: work.content.error
+          }
+        : createEmptyContent()
+      this.outlineStatus = 'done'
+      this.lastSavedAt = null
+    },
+
+    isCurrentWork(version: number) {
+      return version === this.workVersion
+    },
+
+    requestFreshImageGeneration() {
+      this.forceNextImageGeneration = true
+    },
+
+    consumeFreshImageGeneration() {
+      const force = this.forceNextImageGeneration
+      this.forceNextImageGeneration = false
+      return force
+    },
+
     /**
      * 设置用户输入的主题
      * @param topic 主题内容
@@ -431,6 +537,8 @@ export const useGeneratorStore = defineStore('generator', {
      * 用于开始新的生成任务时清空之前的数据
      */
     reset() {
+      this.workVersion++
+      this.forceNextImageGeneration = false
       // 重置当前阶段为输入阶段
       this.stage = 'input'
 
@@ -444,11 +552,7 @@ export const useGeneratorStore = defineStore('generator', {
       }
 
       // 重置图片生成进度
-      this.progress = {
-        current: 0,   // 已完成数量归零
-        total: 0,     // 总数归零
-        status: 'idle' // 状态设为空闲
-      }
+      this.progress = createEmptyProgress()
 
       // 清空生成的图片结果
       this.images = []
@@ -463,12 +567,7 @@ export const useGeneratorStore = defineStore('generator', {
       this.userImages = []
 
       // 重置生成的内容数据
-      this.content = {
-        titles: [],          // 清空标题列表
-        copywriting: '',     // 清空文案
-        tags: [],            // 清空标签列表
-        status: 'idle'       // 状态设为空闲
-      }
+      this.content = createEmptyContent()
 
       // 重置大纲生成状态
       this.outlineStatus = 'idle'
@@ -485,8 +584,10 @@ export const useGeneratorStore = defineStore('generator', {
      * 设置状态为生成中并清除之前的错误
      */
     startContentGeneration() {
+      // 先清空旧的标题、文案和标签，避免生成态或失败态显示上一件作品内容。
+      this.content = createEmptyContent()
       this.content.status = 'generating'
-      this.content.error = undefined
+      return this.workVersion
     },
 
     /**
@@ -495,21 +596,25 @@ export const useGeneratorStore = defineStore('generator', {
      * @param copywriting 文案内容
      * @param tags 标签列表
      */
-    setContent(titles: string[], copywriting: string, tags: string[]) {
+    setContent(titles: string[], copywriting: string, tags: string[], workVersion?: number) {
+      if (workVersion !== undefined && !this.isCurrentWork(workVersion)) return false
       this.content.titles = titles
       this.content.copywriting = copywriting
       this.content.tags = tags
       this.content.status = 'done'
       this.content.error = undefined
+      return true
     },
 
     /**
      * 设置内容生成失败的错误信息
      * @param error 错误描述
      */
-    setContentError(error: string) {
+    setContentError(error: string, workVersion?: number) {
+      if (workVersion !== undefined && !this.isCurrentWork(workVersion)) return false
       this.content.status = 'error'
       this.content.error = error
+      return true
     },
 
     /**
@@ -517,12 +622,7 @@ export const useGeneratorStore = defineStore('generator', {
      * 重置为初始状态
      */
     clearContent() {
-      this.content = {
-        titles: [],
-        copywriting: '',
-        tags: [],
-        status: 'idle'
-      }
+      this.content = createEmptyContent()
     },
 
     /**

@@ -167,7 +167,7 @@ import {
   updateHistory,
   scanAllTasks
 } from '../api'
-import { useGeneratorStore } from '../stores/generator'
+import { useGeneratorStore, type GeneratedImage } from '../stores/generator'
 
 // 引入组件
 import StatsOverview from '../components/history/StatsOverview.vue'
@@ -276,20 +276,42 @@ async function handleSearch() {
 async function loadRecord(id: string) {
   const res = await getHistory(id)
   if (res.success && res.record) {
-    store.setTopic(res.record.title)
-    store.setOutline(res.record.outline.raw, res.record.outline.pages)
-    store.setRecordId(res.record.id)
     const generated = res.record.images.generated || []
+    const taskId = res.record.images.task_id
+    const pages = res.record.outline.pages
+    const doneCount = pages.reduce((count, page, idx) => (
+      generated[page.index] || generated[idx] ? count + 1 : count
+    ), 0)
     if (generated.some(Boolean)) {
-      store.taskId = res.record.images.task_id
-      store.images = res.record.outline.pages.map((page, idx) => {
+      const images: GeneratedImage[] = pages.map((page, idx) => {
         const filename = generated[page.index] || generated[idx] || ''
         return {
           index: page.index,
-          url: filename ? `/api/images/${res.record!.images.task_id}/${filename}` : '',
+          url: filename && taskId ? `/api/images/${taskId}/${filename}` : '',
           status: filename ? 'done' : 'error',
           retryable: !filename
         }
+      })
+      store.replaceWork({
+        topic: res.record.title,
+        outline: res.record.outline,
+        recordId: res.record.id,
+        taskId,
+        images,
+        progress: {
+          current: doneCount,
+          total: pages.length,
+          status: doneCount >= pages.length ? 'done' : 'error'
+        },
+        stage: doneCount >= pages.length ? 'result' : 'generating',
+        content: res.record.content
+      })
+    } else {
+      store.replaceWork({
+        topic: res.record.title,
+        outline: res.record.outline,
+        recordId: res.record.id,
+        content: res.record.content
       })
     }
     router.push('/outline')
@@ -344,7 +366,7 @@ function changePage(p: number) {
 /**
  * 重新生成历史记录中的图片
  */
-async function regenerateHistoryImage(index: number) {
+async function regenerateHistoryImage(index: number, revisionRequest = '') {
   if (!viewingRecord.value || !viewingRecord.value.images.task_id) {
     error.value = normalizeApiError('缺少任务信息，无法重新生成图片。', '无法重新生成')
     return
@@ -359,7 +381,8 @@ async function regenerateHistoryImage(index: number) {
     const context = {
       fullOutline: viewingRecord.value.outline.raw || '',
       userTopic: viewingRecord.value.title || '',
-      recordId: viewingRecord.value.id
+      recordId: viewingRecord.value.id,
+      revisionRequest
     }
 
     const result = await apiRegenerateImage(

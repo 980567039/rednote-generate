@@ -13,8 +13,8 @@
         :value="modelValue"
         @input="handleInput"
         class="composer-textarea"
-        aria-label="创作主题"
-        placeholder="输入主题，例如：使用 Codex 之前和之后的我"
+        :aria-label="topicLabel || '创作主题'"
+        :placeholder="placeholder || '输入主题，例如：使用 Codex 之前和之后的我'"
         :disabled="loading"
         rows="1"
       ></textarea>
@@ -114,6 +114,8 @@ const props = defineProps<{
   modelValue: string
   creativeBrief: string
   loading: boolean
+  placeholder?: string
+  topicLabel?: string
 }>()
 
 // 定义 Emits

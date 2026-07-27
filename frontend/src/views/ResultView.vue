@@ -6,7 +6,7 @@
         <p class="page-subtitle">恭喜！你的小红书图文已生成完毕，共 {{ store.images.length }} 张</p>
       </div>
       <div style="display: flex; gap: 12px;">
-        <button class="btn" @click="startOver" style="background: white; border: 1px solid var(--border-color);">
+        <button class="btn btn-secondary result-back-btn" @click="startOver">
           再来一篇
         </button>
         <button class="btn btn-primary" @click="downloadAll">
@@ -53,7 +53,7 @@
                 </svg>
                 预览大图
               </button>
-              <button class="hover-action-btn" type="button" @click.stop="handleRegenerate(image)">
+              <button class="hover-action-btn" type="button" @click.stop="openRegenerateDialog(image)">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M23 4v6h-6"></path>
                   <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
@@ -70,7 +70,7 @@
               <button
                 style="border: none; background: none; color: var(--text-sub); cursor: pointer; display: flex; align-items: center;"
                 title="重新生成此图"
-                @click="handleRegenerate(image)"
+                @click="openRegenerateDialog(image)"
                 :disabled="regeneratingIndex === image.index"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
@@ -96,6 +96,13 @@
       :alt="previewImage?.alt || ''"
       @close="previewImage = null"
     />
+    <RegenerateImageModal
+      :visible="Boolean(regenerateTarget)"
+      :page-number="(regenerateTarget?.index ?? 0) + 1"
+      :loading="regeneratingIndex !== null"
+      @close="regenerateTarget = null"
+      @confirm="confirmRegenerate"
+    />
   </div>
 </template>
 
@@ -112,6 +119,12 @@
 }
 .image-card:hover img {
   transform: scale(1.05);
+}
+
+.result-back-btn {
+  border: 1px solid var(--border-color);
+  background: var(--bg-control);
+  color: var(--text-main);
 }
 
 .hover-overlay {
@@ -135,8 +148,8 @@
   padding: 8px 14px;
   border: none;
   border-radius: 6px;
-  background: white;
-  color: #333;
+  background: var(--bg-control);
+  color: var(--text-main);
   cursor: pointer;
   font-size: 13px;
   transition: background-color 0.2s, color 0.2s, transform 0.2s;
@@ -157,6 +170,7 @@ import { regenerateImage } from '../api'
 import ContentDisplay from '../components/result/ContentDisplay.vue'
 import ErrorCard from '../components/common/ErrorCard.vue'
 import ImagePreviewModal from '../components/common/ImagePreviewModal.vue'
+import RegenerateImageModal from '../components/common/RegenerateImageModal.vue'
 import { normalizeApiError, type AppError } from '../utils/errors'
 
 const router = useRouter()
@@ -164,6 +178,7 @@ const store = useGeneratorStore()
 const regeneratingIndex = ref<number | null>(null)
 const error = ref<AppError | null>(null)
 const previewImage = ref<{ src: string; alt: string } | null>(null)
+const regenerateTarget = ref<any | null>(null)
 
 const viewImage = (url: string) => {
   const image = store.images.find(item => item.url === url)
@@ -208,8 +223,21 @@ const downloadAll = () => {
   }
 }
 
-const handleRegenerate = async (image: any) => {
-  if (!store.taskId || regeneratingIndex.value !== null) return
+const openRegenerateDialog = (image: any) => {
+  if (regeneratingIndex.value === null) regenerateTarget.value = image
+}
+
+const confirmRegenerate = async (revisionRequest: string) => {
+  if (regenerateTarget.value) await handleRegenerate(regenerateTarget.value, revisionRequest)
+}
+
+const handleRegenerate = async (image: any, revisionRequest = '') => {
+  if (regeneratingIndex.value !== null) return
+  if (!store.taskId) {
+    error.value = normalizeApiError('缺少图片任务信息，无法重新生成。', '无法重新生成')
+    regenerateTarget.value = null
+    return
+  }
 
   regeneratingIndex.value = image.index
   try {
@@ -224,7 +252,8 @@ const handleRegenerate = async (image: any) => {
     const context = {
       fullOutline: store.outline.raw || '',
       userTopic: store.topic || '',
-      recordId: store.recordId
+      recordId: store.recordId,
+      revisionRequest
     }
 
     const result = await regenerateImage(store.taskId, pageContent, true, context)
@@ -238,6 +267,7 @@ const handleRegenerate = async (image: any) => {
     error.value = normalizeApiError(e, '重绘失败')
   } finally {
     regeneratingIndex.value = null
+    regenerateTarget.value = null
   }
 }
 </script>

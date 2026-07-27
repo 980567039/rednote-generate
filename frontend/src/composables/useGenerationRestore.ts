@@ -1,4 +1,4 @@
-import { useGeneratorStore } from '../stores/generator'
+import { useGeneratorStore, type GeneratedImage } from '../stores/generator'
 import {
   createHistory,
   getHistory,
@@ -22,11 +22,7 @@ export function useGenerationRestore() {
       return filename ? count + 1 : count
     }, 0)
 
-    store.setTopic(record.title)
-    store.setOutline(record.outline.raw, pages)
-    store.setRecordId(record.id)
-    store.taskId = taskId
-    store.images = pages.map((page, idx) => {
+    const images: GeneratedImage[] = pages.map((page, idx) => {
       const filename = generated[page.index] || generated[idx] || ''
       return {
         index: page.index,
@@ -35,10 +31,20 @@ export function useGenerationRestore() {
         retryable: !filename
       }
     })
-    store.progress.total = pages.length
-    store.progress.current = doneCount
-    store.progress.status = doneCount >= pages.length ? 'done' : 'error'
-    store.stage = doneCount >= pages.length ? 'result' : 'generating'
+    store.replaceWork({
+      topic: record.title,
+      outline: record.outline,
+      recordId: record.id,
+      taskId,
+      images,
+      progress: {
+        current: doneCount,
+        total: pages.length,
+        status: doneCount >= pages.length ? 'done' : 'error'
+      },
+      stage: doneCount >= pages.length ? 'result' : 'generating',
+      content: record.content
+    })
   }
 
   async function restoreFromHistory(): Promise<boolean> {

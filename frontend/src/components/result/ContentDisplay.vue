@@ -136,7 +136,7 @@
 <script setup lang="ts">
 import { ref, computed, onUnmounted } from 'vue'
 import { useGeneratorStore } from '../../stores/generator'
-import { generateContent } from '../../api'
+import { generateContent, updateHistory } from '../../api'
 import { formatErrorMessage } from '../../utils/errors'
 
 const store = useGeneratorStore()
@@ -176,18 +176,42 @@ async function handleGenerate() {
   if (loading.value) return
 
   loading.value = true
-  store.startContentGeneration()
+  const workVersion = store.startContentGeneration()
+  const topic = store.topic
+  const outline = store.outline.raw
+  const recordId = store.recordId
 
   try {
-    const result = await generateContent(store.topic, store.outline.raw)
+    const result = await generateContent(topic, outline)
+
+    // 用户已开始另一件作品时，忽略旧请求的迟到响应。
+    if (!store.isCurrentWork(workVersion)) return
 
     if (result.success && result.titles && result.copywriting && result.tags) {
-      store.setContent(result.titles, result.copywriting, result.tags)
+      const savedToCurrentWork = store.setContent(
+        result.titles,
+        result.copywriting,
+        result.tags,
+        workVersion
+      )
+      if (savedToCurrentWork && recordId && store.isCurrentWork(workVersion)) {
+        const saveResult = await updateHistory(recordId, {
+          content: {
+            titles: result.titles,
+            copywriting: result.copywriting,
+            tags: result.tags,
+            status: 'done'
+          }
+        })
+        if (!saveResult.success) {
+          console.warn('标题、文案和标签已生成，但保存到历史记录失败:', saveResult.error || saveResult.error_message)
+        }
+      }
     } else {
-      store.setContentError(formatErrorMessage(result.error || result.error_message || '生成失败', '内容生成失败'))
+      store.setContentError(formatErrorMessage(result.error || result.error_message || '生成失败', '内容生成失败'), workVersion)
     }
   } catch (error: any) {
-    store.setContentError(formatErrorMessage(error, '内容生成失败'))
+    store.setContentError(formatErrorMessage(error, '内容生成失败'), workVersion)
   } finally {
     loading.value = false
   }

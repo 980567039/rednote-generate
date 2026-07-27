@@ -87,7 +87,7 @@
               <button
                 class="modal-overlay-btn"
                 type="button"
-                @click.stop="$emit('regenerate', idx)"
+                @click.stop="openRegenerateDialog(idx)"
                 :disabled="regeneratingImages.has(idx)"
               >
                 <svg class="regenerate-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -121,11 +121,19 @@
     :alt="previewImage?.alt || ''"
     @close="previewImage = null"
   />
+  <RegenerateImageModal
+    :visible="regenerateIndex !== null"
+    :page-number="(regenerateIndex ?? 0) + 1"
+    :loading="regenerateIndex !== null && regeneratingImages.has(regenerateIndex)"
+    @close="regenerateIndex = null"
+    @confirm="confirmRegenerate"
+  />
 </template>
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
 import ImagePreviewModal from '../common/ImagePreviewModal.vue'
+import RegenerateImageModal from '../common/RegenerateImageModal.vue'
 
 /**
  * 图片画廊模态框组件
@@ -160,17 +168,19 @@ const props = defineProps<{
 }>()
 
 // 定义 Emits
-defineEmits<{
-  (e: 'close'): void
-  (e: 'showOutline'): void
-  (e: 'downloadAll'): void
-  (e: 'download', filename: string, index: number): void
-  (e: 'regenerate', index: number): void
+const emit = defineEmits<{
+  close: []
+  showOutline: []
+  downloadAll: []
+  download: [filename: string, index: number]
+  regenerate: [index: number, revisionRequest: string]
 }>()
 
 // 标题展开状态
 const titleExpanded = ref(false)
 const previewImage = ref<{ src: string; alt: string } | null>(null)
+const regenerateIndex = ref<number | null>(null)
+const regenerateSubmitted = ref(false)
 
 function openImagePreview(src: string, index: number) {
   previewImage.value = {
@@ -179,9 +189,37 @@ function openImagePreview(src: string, index: number) {
   }
 }
 
+function openRegenerateDialog(index: number) {
+  if (!props.regeneratingImages.has(index)) {
+    regenerateIndex.value = index
+    regenerateSubmitted.value = false
+  }
+}
+
+function confirmRegenerate(revisionRequest: string) {
+  if (regenerateIndex.value !== null) {
+    regenerateSubmitted.value = true
+    emit('regenerate', regenerateIndex.value, revisionRequest)
+  }
+}
+
 watch(() => props.visible, (visible) => {
-  if (!visible) previewImage.value = null
+  if (!visible) {
+    previewImage.value = null
+    regenerateIndex.value = null
+    regenerateSubmitted.value = false
+  }
 })
+
+watch(
+  () => regenerateIndex.value !== null && props.regeneratingImages.has(regenerateIndex.value),
+  (isRegenerating) => {
+    if (regenerateSubmitted.value && !isRegenerating) {
+      regenerateIndex.value = null
+      regenerateSubmitted.value = false
+    }
+  }
+)
 
 // 格式化日期
 const formattedDate = computed(() => {

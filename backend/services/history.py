@@ -30,6 +30,16 @@ class RecordStatus:
     ERROR = "error"          # 错误：生成过程中出现错误
 
 
+class ContentStatus:
+    """成品文案生成状态常量。"""
+
+    IDLE = "idle"
+    GENERATING = "generating"
+    DONE = "done"
+    ERROR = "error"
+    VALUES = {IDLE, GENERATING, DONE, ERROR}
+
+
 class HistoryService:
     def __init__(self):
         """
@@ -119,6 +129,56 @@ class HistoryService:
         """
         return os.path.join(self.history_dir, f"{record_id}.json")
 
+    @staticmethod
+    def _empty_content() -> Dict[str, Any]:
+        """返回互不共享引用的安全成品文案默认值。"""
+        return {
+            "titles": [],
+            "copywriting": "",
+            "tags": [],
+            "status": ContentStatus.IDLE,
+        }
+
+    @classmethod
+    def _normalize_content(cls, content: Any) -> Dict[str, Any]:
+        """兼容没有 content 或字段不完整的旧历史记录。"""
+        if not isinstance(content, dict):
+            return cls._empty_content()
+
+        titles = content.get("titles", [])
+        tags = content.get("tags", [])
+        copywriting = content.get("copywriting", "")
+
+        normalized = {
+            "titles": (
+                [item for item in titles if isinstance(item, str)]
+                if isinstance(titles, list)
+                else []
+            ),
+            "copywriting": copywriting if isinstance(copywriting, str) else "",
+            "tags": (
+                [item for item in tags if isinstance(item, str)]
+                if isinstance(tags, list)
+                else []
+            ),
+        }
+
+        status = content.get("status")
+        if status not in ContentStatus.VALUES:
+            has_generated_content = bool(
+                normalized["titles"]
+                or normalized["copywriting"]
+                or normalized["tags"]
+            )
+            status = ContentStatus.DONE if has_generated_content else ContentStatus.IDLE
+        normalized["status"] = status
+
+        error = content.get("error")
+        if isinstance(error, str) and error:
+            normalized["error"] = error
+
+        return normalized
+
     def _recover_interrupted_generations(self) -> None:
         """服务重启后收敛遗留的 generating 记录，不自动重提上游请求。"""
         with self._ensure_lock():
@@ -198,6 +258,7 @@ class HistoryService:
                     "task_id": task_id,
                     "generated": []  # 初始无生成图片
                 },
+                "content": self._empty_content(),
                 "status": RecordStatus.DRAFT,  # 初始状态：草稿
                 "thumbnail": None  # 初始无缩略图
             }
@@ -253,6 +314,9 @@ class HistoryService:
         except Exception:
             return None
 
+        # 旧版本记录没有 content；读取时补齐，调用方无需区分数据版本。
+        record["content"] = self._normalize_content(record.get("content"))
+
         if sync_images:
             synced = self.sync_record_images(record_id, record)
             if synced.get("success") and synced.get("updated"):
@@ -279,7 +343,8 @@ class HistoryService:
         outline: Optional[Dict] = None,
         images: Optional[Dict] = None,
         status: Optional[str] = None,
-        thumbnail: Optional[str] = None
+        thumbnail: Optional[str] = None,
+        content: Optional[Dict] = None
     ) -> bool:
         """
         更新历史记录
@@ -293,6 +358,7 @@ class HistoryService:
             images: 图片信息（可选，包含 task_id 和 generated 列表）
             status: 状态（可选）
             thumbnail: 缩略图文件名（可选）
+            content: 成品文案（可选，包含 titles、copywriting、tags 和 status）
 
         Returns:
             bool: 更新是否成功，记录不存在时返回 False
@@ -322,6 +388,12 @@ class HistoryService:
             # 更新图片信息
             if images is not None:
                 record["images"] = self._merge_safe_images(record.get("images"), images)
+
+            # content 支持嵌套部分更新；路由层负责拒绝非法类型。
+            if content is not None:
+                merged_content = self._normalize_content(record.get("content"))
+                merged_content.update(content)
+                record["content"] = self._normalize_content(merged_content)
 
             # 更新状态（状态流转）
             if status is not None:
@@ -374,6 +446,20 @@ class HistoryService:
             if not record:
                 return False
 
+            # 图片 worker 可能在用户重新生成、或编辑页数并开启新任务后才返回。
+            # 历史记录只接受当前绑定任务的逐页结果，避免旧任务的迟到结果把
+            # 新任务的图片列表、缩略图和状态覆盖掉。
+            active_task_id = (record.get("images") or {}).get("task_id")
+            if active_task_id and active_task_id != task_id:
+                logger.warning(
+                    "忽略过期任务图片回写: record=%s task=%s active=%s index=%s",
+                    record_id,
+                    task_id,
+                    active_task_id,
+                    page_index,
+                )
+                return False
+
             if total_count is None:
                 total_count = len(record.get("outline", {}).get("pages", []))
 
@@ -403,11 +489,14 @@ class HistoryService:
         if not record:
             return False
         images = record.get("images") or {}
+        # 绑定新任务代表开始一轮全新的生成，旧任务图片不能跟随到新任务。
+        # 同一任务的断线续传/失败重试则继续保留已生成页。
+        is_new_task = bool(images.get("task_id") and images.get("task_id") != task_id)
         return self.update_record(
             record_id,
             images={
                 "task_id": task_id,
-                "generated": images.get("generated") or [],
+                "generated": [] if is_new_task else images.get("generated") or [],
             },
             status=RecordStatus.GENERATING,
         )
@@ -486,7 +575,19 @@ class HistoryService:
         current_generated = current.get("generated") or []
         incoming_generated = incoming.get("generated")
 
+        # 显式绑定一个不同的新任务且传入空列表，表示开始一次全新生成。
+        # 此时必须清空旧任务的图片；否则编辑页数或 force 重生成会继续显示
+        # 已经不属于当前任务的文件名。
+        starts_new_task = bool(
+            incoming.get("task_id")
+            and incoming.get("task_id") != current.get("task_id")
+            and isinstance(incoming_generated, list)
+            and not incoming_generated
+        )
+
         if (
+            not starts_new_task
+            and
             isinstance(incoming_generated, list)
             and not HistoryImageMerger.has_images(incoming_generated)
             and HistoryImageMerger.has_images(current_generated)

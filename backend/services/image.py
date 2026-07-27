@@ -184,7 +184,11 @@ class ImageService:
                             self._safe_task_state(active_state),
                         )
 
-            if task_id is None and record:
+            # force 表示当前大纲（尤其是编辑页数后）必须作为一次新的图片任务
+            # 执行。绝不能复用旧任务目录，否则旧图片会混进新的页数和结果中。
+            if force:
+                task_id = f"task_{uuid.uuid4().hex[:8]}"
+            elif task_id is None and record:
                 task_id = (record.get("images") or {}).get("task_id")
             if task_id is None or (
                 task_id in self._task_states
@@ -193,7 +197,10 @@ class ImageService:
                 task_id = f"task_{uuid.uuid4().hex[:8]}"
 
             now = self._now()
-            existing_generated = ((record or {}).get("images") or {}).get("generated") or []
+            # 新任务从空图片列表开始；缓存复用路径已经在上方提前返回。
+            existing_generated = [] if force else (
+                ((record or {}).get("images") or {}).get("generated") or []
+            )
             self._task_states[task_id] = {
                 "task_id": task_id,
                 "record_id": record_id,
@@ -827,7 +834,8 @@ class ImageService:
         use_reference: bool = True,
         full_outline: str = "",
         user_topic: str = "",
-        record_id: Optional[str] = None
+        record_id: Optional[str] = None,
+        revision_request: str = ""
     ) -> Dict[str, Any]:
         """
         重试生成单张图片
@@ -873,9 +881,17 @@ class ImageService:
         if task_id in self._task_states:
             total_count = len(self._task_states[task_id].get("pages", []))
 
+        page_for_generation = dict(page)
+        if revision_request:
+            original_content = str(page_for_generation.get("content", ""))
+            page_for_generation["content"] = (
+                f"{original_content}\n\n【本次重绘修改意见】{revision_request}\n"
+                "请在保留本页核心信息的前提下，优先落实以上修改意见。"
+            )
+
         self._update_task(task_id, status="running", phase="retry", finished_at=None)
         index, success, filename, error = self._generate_single_image(
-            page,
+            page_for_generation,
             task_id,
             reference_image,
             0,
@@ -1093,7 +1109,8 @@ class ImageService:
         use_reference: bool = True,
         full_outline: str = "",
         user_topic: str = "",
-        record_id: Optional[str] = None
+        record_id: Optional[str] = None,
+        revision_request: str = ""
     ) -> Dict[str, Any]:
         """
         重新生成图片（用户手动触发，即使成功的也可以重新生成）
@@ -1104,6 +1121,7 @@ class ImageService:
             use_reference: 是否使用封面作为参考
             full_outline: 完整大纲文本
             user_topic: 用户原始输入
+            revision_request: 本次重绘的补充修改意见
 
         Returns:
             生成结果
@@ -1112,7 +1130,8 @@ class ImageService:
             task_id, page, use_reference,
             full_outline=full_outline,
             user_topic=user_topic,
-            record_id=record_id
+            record_id=record_id,
+            revision_request=revision_request
         )
 
     def get_image_path(self, task_id: str, filename: str) -> str:

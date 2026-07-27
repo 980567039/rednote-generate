@@ -14,10 +14,37 @@ import io
 import zipfile
 import logging
 from flask import Blueprint, request, jsonify, send_file
-from backend.services.history import get_history_service
+from backend.services.history import ContentStatus, get_history_service
 from .utils import api_error_response, normalize_error_result, validation_error
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_content_payload(content):
+    """校验历史记录中的成品文案字段，返回可读的错误详情或 None。"""
+    if not isinstance(content, dict):
+        return "content 必须是对象"
+
+    if "titles" in content:
+        titles = content["titles"]
+        if not isinstance(titles, list) or any(not isinstance(item, str) for item in titles):
+            return "content.titles 必须是字符串列表"
+
+    if "copywriting" in content and not isinstance(content["copywriting"], str):
+        return "content.copywriting 必须是字符串"
+
+    if "tags" in content:
+        tags = content["tags"]
+        if not isinstance(tags, list) or any(not isinstance(item, str) for item in tags):
+            return "content.tags 必须是字符串列表"
+
+    if "status" in content and content["status"] not in ContentStatus.VALUES:
+        return "content.status 必须是 idle、generating、done 或 error"
+
+    if "error" in content and content["error"] is not None and not isinstance(content["error"], str):
+        return "content.error 必须是字符串"
+
+    return None
 
 
 def create_history_blueprint():
@@ -186,6 +213,7 @@ def create_history_blueprint():
         请求体（均为可选）：
         - outline: 大纲内容（支持修改大纲）
         - images: 图片信息 { task_id, generated: [] }
+        - content: 成品文案 { titles: [], copywriting: "", tags: [], status: "done" }
         - status: 状态（draft/generating/partial/completed/error）
         - thumbnail: 缩略图文件名
 
@@ -216,17 +244,32 @@ def create_history_blueprint():
         }
         """
         try:
-            data = request.get_json()
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return api_error_response(
+                    validation_error("请求体必须是 JSON 对象", "请检查提交的数据格式。"),
+                    context={"endpoint": "/api/history/<id>", "record_id": record_id},
+                )
             outline = data.get('outline')
             images = data.get('images')
+            content = data.get('content')
             status = data.get('status')
             thumbnail = data.get('thumbnail')
+
+            if 'content' in data:
+                content_error = _validate_content_payload(content)
+                if content_error:
+                    return api_error_response(
+                        validation_error(content_error, "请按 titles、copywriting、tags 和 status 的类型提交。"),
+                        context={"endpoint": "/api/history/<id>", "record_id": record_id},
+                    )
 
             history_service = get_history_service()
             success = history_service.update_record(
                 record_id,
                 outline=outline,
                 images=images,
+                content=content,
                 status=status,
                 thumbnail=thumbnail
             )
