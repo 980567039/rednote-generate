@@ -1,4 +1,5 @@
 import logging
+import os
 import yaml
 from pathlib import Path
 
@@ -6,9 +7,11 @@ logger = logging.getLogger(__name__)
 
 
 class Config:
-    DEBUG = True
-    HOST = '0.0.0.0'
-    PORT = 12398
+    DEBUG = os.getenv('FLASK_DEBUG', 'true').lower() in {'1', 'true', 'yes', 'on'}
+    # 发布接口可以操作本机已登录的小红书账号，本地运行默认只监听回环地址。
+    # Docker 显式设置 FLASK_HOST=0.0.0.0 后仍可按原方式对外提供容器端口。
+    HOST = os.getenv('FLASK_HOST', '127.0.0.1')
+    PORT = int(os.getenv('FLASK_PORT', '12398'))
     CORS_ORIGINS = ['http://localhost:5173', 'http://localhost:3000']
     OUTPUT_DIR = 'output'
 

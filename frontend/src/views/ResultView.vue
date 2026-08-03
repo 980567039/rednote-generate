@@ -5,14 +5,26 @@
         <h1 class="page-title">创作完成</h1>
         <p class="page-subtitle">恭喜！你的小红书图文已生成完毕，共 {{ store.images.length }} 张</p>
       </div>
-      <div style="display: flex; gap: 12px;">
-        <button class="btn btn-secondary result-back-btn" @click="startOver">
-          再来一篇
-        </button>
-        <button class="btn btn-primary" @click="downloadAll">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-          一键下载
-        </button>
+      <div class="result-actions-wrap">
+        <div class="result-actions">
+          <button class="btn btn-secondary result-back-btn" @click="startOver">
+            再来一篇
+          </button>
+          <button class="btn btn-primary" @click="downloadAll">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+            一键下载
+          </button>
+          <button
+            class="btn btn-secondary publish-button"
+            type="button"
+            :disabled="!canPublish"
+            :title="publishDisabledReason"
+            @click="showPublishModal = true"
+          >
+            发布到小红书
+          </button>
+        </div>
+        <p v-if="!canPublish" class="publish-disabled-hint">{{ publishDisabledReason }}</p>
       </div>
     </div>
 
@@ -103,6 +115,15 @@
       @close="regenerateTarget = null"
       @confirm="confirmRegenerate"
     />
+    <PublishModal
+      :visible="showPublishModal"
+      :record-id="store.recordId || ''"
+      :titles="store.content.titles"
+      :copywriting="store.content.copywriting"
+      :tags="store.content.tags"
+      :image-count="store.images.length"
+      @close="showPublishModal = false"
+    />
   </div>
 </template>
 
@@ -160,10 +181,15 @@
   color: white;
   transform: translateY(-1px);
 }
+
+.publish-button { white-space: nowrap; }
+.result-actions-wrap { display: grid; justify-items: end; gap: 6px; }
+.result-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 12px; }
+.publish-disabled-hint { margin: 0; color: var(--text-secondary); font-size: 12px; }
 </style>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useGeneratorStore } from '../stores/generator'
 import { regenerateImage } from '../api'
@@ -171,6 +197,7 @@ import ContentDisplay from '../components/result/ContentDisplay.vue'
 import ErrorCard from '../components/common/ErrorCard.vue'
 import ImagePreviewModal from '../components/common/ImagePreviewModal.vue'
 import RegenerateImageModal from '../components/common/RegenerateImageModal.vue'
+import PublishModal from '../components/result/PublishModal.vue'
 import { normalizeApiError, type AppError } from '../utils/errors'
 
 const router = useRouter()
@@ -179,6 +206,21 @@ const regeneratingIndex = ref<number | null>(null)
 const error = ref<AppError | null>(null)
 const previewImage = ref<{ src: string; alt: string } | null>(null)
 const regenerateTarget = ref<any | null>(null)
+const showPublishModal = ref(false)
+
+const canPublish = computed(() => Boolean(
+  store.recordId
+  && store.content.status === 'done'
+  && store.images.length > 0
+  && store.images.every(image => image.status === 'done' && Boolean(image.url))
+))
+
+const publishDisabledReason = computed(() => {
+  if (!store.recordId) return '当前作品还没有历史记录，无法发布'
+  if (store.content.status !== 'done') return '请先生成标题、正文和标签'
+  if (!store.images.length || !store.images.every(image => image.status === 'done' && Boolean(image.url))) return '请等待全部图片生成完成'
+  return ''
+})
 
 const viewImage = (url: string) => {
   const image = store.images.find(item => item.url === url)

@@ -29,6 +29,7 @@ def create_api_blueprint():
     from .config_routes import create_config_blueprint
     from .content_routes import create_content_blueprint
     from .trend_routes import create_trend_blueprint
+    from .publish_routes import create_publish_blueprint
 
     # 创建主 API 蓝图
     api_bp = Blueprint('api', __name__, url_prefix='/api')
@@ -40,6 +41,7 @@ def create_api_blueprint():
     api_bp.register_blueprint(create_config_blueprint())
     api_bp.register_blueprint(create_content_blueprint())
     api_bp.register_blueprint(create_trend_blueprint())
+    api_bp.register_blueprint(create_publish_blueprint())
 
     return api_bp
 

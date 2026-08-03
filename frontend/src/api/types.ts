@@ -136,3 +136,61 @@ export interface ContentResponse {
   error?: AppError | string
   error_message?: string
 }
+
+export type PublishMode = 'preview' | 'auto'
+
+export type PublishTaskStatus =
+  | 'queued'
+  | 'validating'
+  | 'checking_auth'
+  | 'auth_required'
+  | 'launching_browser'
+  | 'opening_browser'
+  | 'uploading'
+  | 'filling'
+  | 'ready_for_review'
+  | 'submitting'
+  | 'submitted'
+  | 'published'
+  | 'failed'
+  | 'unknown'
+
+export interface PublishConfig {
+  account: string
+  port: number
+  headless: boolean
+  default_mode: PublishMode
+  publisher_available: boolean
+  publisher_dir: string
+}
+
+export interface PublishTask {
+  id: string
+  task_id?: string
+  status: PublishTaskStatus
+  phase?: string
+  message?: string
+  mode?: PublishMode
+  created_at?: string
+  updated_at?: string
+  error?: AppError | string
+  error_message?: string
+  note_url?: string | null
+  output?: string
+  record_id?: string
+  authenticated?: boolean
+}
+
+export interface PublishApiResponse {
+  success: boolean
+  message?: string
+  logged_in?: boolean
+  authenticated?: boolean
+  login_started?: boolean
+  output?: string
+  returncode?: number
+  config?: PublishConfig
+  task?: PublishTask
+  error?: AppError | string
+  error_message?: string
+}

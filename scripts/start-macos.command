@@ -109,6 +109,26 @@ check_ports() {
     echo ""
 }
 
+ensure_publisher_component() {
+    local publisher_dir="$PROJECT_DIR/third_party/XiaohongshuSkills"
+    if [[ -f "$publisher_dir/scripts/publish_pipeline.py" ]]; then
+        echo -e "  ${GREEN}✓${NC} 小红书发布组件已就绪"
+        return 0
+    fi
+
+    if ! command -v git &> /dev/null || [[ ! -f "$PROJECT_DIR/.gitmodules" ]]; then
+        echo -e "  ${YELLOW}!${NC} 未找到小红书发布组件；生成和下载功能仍可使用"
+        return 0
+    fi
+
+    echo -e "  ${CYAN}→${NC} 初始化小红书发布组件（首次运行需要网络）"
+    if git -C "$PROJECT_DIR" submodule update --init third_party/XiaohongshuSkills; then
+        echo -e "  ${GREEN}✓${NC} 小红书发布组件已就绪"
+    else
+        echo -e "  ${YELLOW}!${NC} 发布组件初始化失败；可稍后执行：git submodule update --init"
+    fi
+}
+
 install_deps() {
     echo -e "${BLUE}📦 检查项目依赖...${NC}"
 
@@ -277,6 +297,7 @@ print_banner
 check_homebrew
 check_requirements
 check_ports
+ensure_publisher_component
 install_deps
 start_services
 monitor_services
