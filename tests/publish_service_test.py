@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -253,6 +254,32 @@ def test_interrupted_task_is_recovered_as_unknown(tmp_path):
     assert saved["tasks"][0]["status"] == "unknown"
 
 
+def test_cancel_queued_publish_task_persists_cancelled_status(tmp_path):
+    service = make_service(tmp_path, start_worker=False)
+    task = service.create_publish_task(
+        "record_1", title="待取消", copywriting="正文内容", tags=[], mode="preview", confirm=True
+    )
+
+    cancelled = service.cancel_task(task["id"])
+
+    assert cancelled["status"] == "cancelled"
+    assert "已取消" in cancelled["error"]
+    assert service.get_task(task["id"])["status"] == "cancelled"
+
+
+def test_cancel_submitting_task_marks_result_unknown(tmp_path):
+    service = make_service(tmp_path, start_worker=False)
+    task = service.create_publish_task(
+        "record_1", title="提交中取消", copywriting="正文内容", tags=[], mode="auto", confirm=True
+    )
+    service._set_status(task["id"], "submitting")
+
+    cancelled = service.cancel_task(task["id"])
+
+    assert cancelled["status"] == "unknown"
+    assert "无法确认平台是否已经提交" in cancelled["error"]
+
+
 def test_unavailable_publisher_is_reported_without_subprocess(tmp_path):
     called = False
 
@@ -273,6 +300,145 @@ def test_unavailable_publisher_is_reported_without_subprocess(tmp_path):
     assert login_result["success"] is False
     assert login_result["error"]["code"] == "PUBLISHER_UNAVAILABLE"
     assert login_result["status"] == 503
+
+
+def test_auth_login_returns_qrcode_without_restarting_chrome(tmp_path):
+    calls = []
+    qrcode_data_url = "data:image/png;base64,cXJjb2Rl"
+
+    def runner(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "publisher ready\nGET_LOGIN_QRCODE_RESULT:\n"
+                + json.dumps({
+                    "logged_in": False,
+                    "qrcode_data_url": qrcode_data_url,
+                    "mime_type": "image/png",
+                })
+            ),
+            stderr="",
+        )
+
+    service = make_service(tmp_path, runner=runner)
+    service.update_config({"headless": True})
+    result = service.auth_login()
+
+    assert result["success"] is True
+    assert result["login_started"] is True
+    assert result["logged_in"] is False
+    assert result["login_url"] == "https://creator.xiaohongshu.com/login"
+    assert result["qrcode_data_url"] == qrcode_data_url
+    args, kwargs = calls[0]
+    assert "--reuse-existing-tab" in args
+    assert "get-login-qrcode" in args
+    assert "login" not in args
+    assert "--headless" not in args
+    assert args[args.index("--wait-seconds") + 1] == "3"
+    assert kwargs["timeout"] == 20
+    assert kwargs["shell"] is False
+
+
+def test_auth_login_normalizes_legacy_base64_qrcode(tmp_path):
+    def runner(args, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "GET_LOGIN_QRCODE_RESULT:\n"
+                + json.dumps({"logged_in": False, "qrcode_base64": "cXJjb2Rl", "mime_type": "image/png"})
+            ),
+            stderr="",
+        )
+
+    service = make_service(tmp_path, runner=runner)
+    result = service.auth_login()
+
+    assert result["success"] is True
+    assert result["qrcode_data_url"] == "data:image/png;base64,cXJjb2Rl"
+
+
+def test_auth_login_treats_opened_page_as_started_when_qrcode_is_still_loading(tmp_path):
+    def runner(args, **kwargs):
+        return SimpleNamespace(
+            returncode=1,
+            stdout="[cdp_publish] Navigating to https://creator.xiaohongshu.com/login",
+            stderr="Failed to locate login QR code: qrcode_not_found",
+        )
+
+    service = make_service(tmp_path, runner=runner)
+    result = service.auth_login()
+
+    assert result["success"] is True
+    assert result["login_started"] is True
+    assert result["logged_in"] is False
+    assert result["qrcode_data_url"] == ""
+    assert result["returncode"] == 1
+
+
+def test_auth_check_reuses_existing_tab(tmp_path):
+    calls = []
+
+    def runner(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=1, stdout="NOT_LOGGED_IN", stderr="")
+
+    service = make_service(tmp_path, runner=runner)
+    result = service.auth_check()
+
+    assert result["success"] is True
+    assert result["logged_in"] is False
+    assert "--reuse-existing-tab" in calls[0]
+
+
+@pytest.mark.parametrize(
+    "command,expected_code",
+    [
+        ("check-login", "PUBLISH_AUTH_CHECK_TIMEOUT"),
+        ("get-login-qrcode", "PUBLISH_LOGIN_TIMEOUT"),
+    ],
+)
+def test_auth_command_timeouts_have_publish_error_codes(tmp_path, command, expected_code):
+    def runner(args, **kwargs):
+        if command in args:
+            raise subprocess.TimeoutExpired(
+                args,
+                kwargs["timeout"],
+                output=f"/Users/private/project api_key=secret-value {command}",
+                stderr="timed out",
+            )
+        raise AssertionError(args)
+
+    service = make_service(tmp_path, runner=runner)
+    result = service.auth_check() if command == "check-login" else service.auth_login()
+
+    assert result["success"] is False
+    assert result["status"] == 504
+    assert result["error"]["code"] == expected_code
+    assert result["error"]["retryable"] is True
+    assert "/Users/private" not in result["output"]
+    assert "secret-value" not in result["output"]
+
+
+@pytest.mark.parametrize(
+    "command,expected_code",
+    [
+        ("check-login", "PUBLISH_AUTH_CHECK_FAILED"),
+        ("get-login-qrcode", "PUBLISH_LOGIN_FAILED"),
+    ],
+)
+def test_auth_command_nonzero_exit_has_publish_error_code(tmp_path, command, expected_code):
+    def runner(args, **kwargs):
+        assert command in args
+        return SimpleNamespace(returncode=2, stdout="CLI failed", stderr="details")
+
+    service = make_service(tmp_path, runner=runner)
+    result = service.auth_check() if command == "check-login" else service.auth_login()
+
+    assert result["success"] is False
+    assert result["status"] == 502
+    assert result["error"]["code"] == expected_code
+    assert result["error_message"].startswith(result["error"]["title"])
 
 
 def test_preview_confirmation_click_without_url_is_submitted(tmp_path):

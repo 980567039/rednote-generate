@@ -295,7 +295,8 @@ const handleRegenerate = async (image: any, revisionRequest = '') => {
       fullOutline: store.outline.raw || '',
       userTopic: store.topic || '',
       recordId: store.recordId,
-      revisionRequest
+      revisionRequest,
+      series: store.getSeriesRequestContext()
     }
 
     const result = await regenerateImage(store.taskId, pageContent, true, context)

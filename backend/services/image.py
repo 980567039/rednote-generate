@@ -147,6 +147,10 @@ class ImageService:
             "updated_at": state.get("updated_at"),
             "finished_at": state.get("finished_at"),
             "has_cover": state.get("cover_image") is not None,
+            "series_id": state.get("series_id"),
+            "series_template_id": state.get("series_template_id"),
+            "series_project_id": state.get("series_project_id"),
+            "series_item_id": state.get("series_item_id"),
         }
 
     def prepare_generation(
@@ -155,6 +159,13 @@ class ImageService:
         task_id: Optional[str] = None,
         record_id: Optional[str] = None,
         force: bool = False,
+        series_context: str = "",
+        series_id: Optional[str] = None,
+        series_template_id: Optional[str] = None,
+        series_project_id: Optional[str] = None,
+        series_item_id: Optional[str] = None,
+        series_template: Optional[Dict[str, Any]] = None,
+        **_: Any,
     ) -> Dict[str, Any]:
         """原子预留任务 ID，并在任何上游调用前绑定历史记录。"""
         self._ensure_runtime_state()
@@ -220,6 +231,11 @@ class ImageService:
                 "full_outline": "",
                 "user_images": None,
                 "user_topic": "",
+                "series_context": series_context or "",
+                "series_id": series_id,
+                "series_template_id": series_template_id,
+                "series_project_id": series_project_id,
+                "series_item_id": series_item_id,
                 "error": None,
                 "created_at": now,
                 "started_at": None,
@@ -311,6 +327,7 @@ class ImageService:
         total_count: Optional[int] = None,
         task_dir: Optional[str] = None,
         phase: str = "content",
+        series_context: str = "",
     ) -> Tuple[int, bool, Optional[str], Optional[str]]:
         """
         生成单张图片（带自动重试）
@@ -354,16 +371,24 @@ class ImageService:
                     user_topic=user_topic if user_topic else "未提供"
                 )
 
+            if series_context:
+                prompt += (
+                    "\n\n" + series_context +
+                    "\n【系列图片硬约束】必须保持系列画风、色板、镜头语言和角色外观；"
+                    "禁止改变系列页面数量与构图规则。文字只作辅助信息，禁止密集文字和禁用元素。"
+                )
+
             # 调用生成器生成图片。所有路径共用 limiter，避免批量和重试打爆上游。
             with self.rate_limiter.acquire():
                 if self.provider_config.get('type') == 'google_genai':
                     logger.debug(f"  使用 Google GenAI 生成器")
+                    google_reference = reference_image or (user_images[0] if user_images else None)
                     image_data = self.generator.generate_image(
                         prompt=prompt,
                         aspect_ratio=self.provider_config.get('default_aspect_ratio', '3:4'),
                         temperature=self.provider_config.get('temperature', 1.0),
                         model=self.provider_config.get('model', 'gemini-3-pro-image-preview'),
-                        reference_image=reference_image,
+                        reference_image=google_reference,
                     )
                 elif self.provider_config.get('type') == 'image_api':
                     logger.debug(f"  使用 Image API 生成器")
@@ -423,10 +448,24 @@ class ImageService:
         force: bool = False,
         prepared: bool = False,
         cached: bool = False,
+        series_context: str = "",
+        series_id: Optional[str] = None,
+        series_template_id: Optional[str] = None,
+        series_project_id: Optional[str] = None,
+        series_item_id: Optional[str] = None,
+        series_template: Optional[Dict[str, Any]] = None,
+        **_: Any,
     ) -> Generator[Dict[str, Any], None, None]:
         """安全包装生成流，确保断流和内部异常也写入任务终态。"""
         if not prepared:
-            reservation = self.prepare_generation(pages, task_id, record_id, force)
+            reservation = self.prepare_generation(
+                pages, task_id, record_id, force,
+                series_context=series_context,
+                series_id=series_id,
+                series_template_id=series_template_id,
+                series_project_id=series_project_id,
+                series_item_id=series_item_id,
+            )
             task_id = reservation["task_id"]
             cached = reservation["cached"]
             prepared = True
@@ -442,6 +481,11 @@ class ImageService:
                 force,
                 prepared,
                 cached,
+                series_context,
+                series_id,
+                series_template_id,
+                series_project_id,
+                series_item_id,
             )
         except GeneratorExit:
             self._settle_aborted_task(task_id, record_id, "interrupted", "客户端连接已中断")
@@ -510,10 +554,22 @@ class ImageService:
         force: bool = False,
         prepared: bool = False,
         cached: bool = False,
+        series_context: str = "",
+        series_id: Optional[str] = None,
+        series_template_id: Optional[str] = None,
+        series_project_id: Optional[str] = None,
+        series_item_id: Optional[str] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """生成图片，并用真实任务状态驱动 SSE。"""
         if not prepared:
-            reservation = self.prepare_generation(pages, task_id, record_id, force)
+            reservation = self.prepare_generation(
+                pages, task_id, record_id, force,
+                series_context=series_context,
+                series_id=series_id,
+                series_template_id=series_template_id,
+                series_project_id=series_project_id,
+                series_item_id=series_item_id,
+            )
             task_id = reservation["task_id"]
             cached = reservation["cached"]
 
@@ -549,6 +605,11 @@ class ImageService:
             full_outline=full_outline,
             user_images=compressed_user_images,
             user_topic=user_topic,
+            series_context=series_context,
+            series_id=series_id,
+            series_template_id=series_template_id,
+            series_project_id=series_project_id,
+            series_item_id=series_item_id,
         )
         logger.info("开始图片生成任务: task_id=%s, pages=%s", task_id, total)
 
@@ -588,6 +649,7 @@ class ImageService:
                 total_count=total,
                 task_dir=task_dir,
                 phase="cover",
+                series_context=series_context,
             )
             index, success, filename, error = result
             if success:
@@ -655,10 +717,13 @@ class ImageService:
             }
 
             def generate_page(page: Dict):
+                # 角色图模式的每一页都代表一个独立角色，不能把第一张角色图作为后续角色的
+                # 参考图，否则模型容易复制成“全员合照”或让后续角色外观被首个角色带偏。
+                page_reference = None if "内容方向：精细角色图" in series_context else cover_image_data
                 return self._generate_single_image(
                     page,
                     task_id,
-                    cover_image_data,
+                    page_reference,
                     0,
                     full_outline,
                     compressed_user_images,
@@ -667,6 +732,7 @@ class ImageService:
                     total,
                     task_dir,
                     "content",
+                    series_context,
                 )
 
             if self.worker_count > 1:
@@ -835,7 +901,8 @@ class ImageService:
         full_outline: str = "",
         user_topic: str = "",
         record_id: Optional[str] = None,
-        revision_request: str = ""
+        revision_request: str = "",
+        series_context: str = "",
     ) -> Dict[str, Any]:
         """
         重试生成单张图片
@@ -867,6 +934,8 @@ class ImageService:
             if not user_topic:
                 user_topic = task_state.get("user_topic", "")
             user_images = task_state.get("user_images")
+            if not series_context:
+                series_context = task_state.get("series_context", "")
 
         # 如果任务状态中没有封面图，尝试从文件系统加载
         if use_reference and reference_image is None:
@@ -902,6 +971,7 @@ class ImageService:
             total_count,
             task_dir,
             "retry",
+            series_context,
         )
 
         if success:
@@ -931,7 +1001,8 @@ class ImageService:
         self,
         task_id: str,
         pages: List[Dict],
-        record_id: Optional[str] = None
+        record_id: Optional[str] = None,
+        series_context: str = ""
     ) -> Generator[Dict[str, Any], None, None]:
         """
         批量重试失败的图片
@@ -956,6 +1027,8 @@ class ImageService:
             reference_image = task_state.get("cover_image")
             user_images = task_state.get("user_images")
             user_topic = task_state.get("user_topic", "")
+            if not series_context:
+                series_context = task_state.get("series_context", "")
 
         if reference_image is None:
             cover_path = os.path.join(self.history_root_dir, task_id, "0.png")
@@ -1032,6 +1105,7 @@ class ImageService:
                         total_count,
                         task_dir,
                         "retry",
+                        series_context,
                     ): page
                     for page in pages
                 }
@@ -1065,6 +1139,7 @@ class ImageService:
                     total_count,
                     task_dir,
                     "retry",
+                    series_context,
                 )
                 yield handle_result(page, result)
 
@@ -1110,7 +1185,8 @@ class ImageService:
         full_outline: str = "",
         user_topic: str = "",
         record_id: Optional[str] = None,
-        revision_request: str = ""
+        revision_request: str = "",
+        series_context: str = ""
     ) -> Dict[str, Any]:
         """
         重新生成图片（用户手动触发，即使成功的也可以重新生成）
@@ -1131,7 +1207,8 @@ class ImageService:
             full_outline=full_outline,
             user_topic=user_topic,
             record_id=record_id,
-            revision_request=revision_request
+            revision_request=revision_request,
+            series_context=series_context,
         )
 
     def get_image_path(self, task_id: str, filename: str) -> str:

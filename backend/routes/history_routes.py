@@ -91,6 +91,10 @@ def create_history_blueprint():
             topic = data.get('topic')
             outline = data.get('outline')
             task_id = data.get('task_id')
+            series_id = data.get('series_id')
+            series_template_id = data.get('series_template_id')
+            series_item_index = data.get('series_item_index')
+            series_item_title = data.get('series_item_title')
 
             if not topic or not outline:
                 return api_error_response(
@@ -99,7 +103,17 @@ def create_history_blueprint():
                 )
 
             history_service = get_history_service()
-            record_id = history_service.create_record(topic, outline, task_id)
+            record_id = history_service.create_record(
+                topic, outline, task_id,
+                series_id=series_id,
+                series_project_id=data.get('series_project_id'),
+                series_template_id=series_template_id,
+                series_item_index=series_item_index,
+                series_item_title=series_item_title,
+                series_item_id=data.get('series_item_id'),
+                series_topic_source=data.get('series_topic_source'),
+                series_content_mode=data.get('content_mode') or data.get('series_content_mode'),
+            )
 
             return jsonify({
                 "success": True,

@@ -14,7 +14,7 @@
  * 4. result: 查看生成结果
  */
 import { defineStore } from 'pinia'
-import type { Page } from '../api'
+import type { Page, SeriesRequestContext } from '../api'
 
 /**
  * 生成的图片信息
@@ -75,6 +75,9 @@ export interface GeneratorState {
   // 历史记录ID（用于保存和加载历史记录）
   recordId: string | null
 
+  // 系列作品规则上下文。普通自由创作为空对象。
+  seriesContext: SeriesRequestContext
+
   // 用户上传的参考图片（File对象，不会被持久化）
   userImages: File[]
 
@@ -95,6 +98,7 @@ export interface WorkReplacement {
     pages: Page[]
   }
   recordId: string | null
+  seriesContext?: SeriesRequestContext
   taskId?: string | null
   images?: GeneratedImage[]
   progress?: GeneratorState['progress']
@@ -152,6 +156,7 @@ function saveState(state: GeneratorState) {
       images: state.images,                  // 生成的图片结果
       taskId: state.taskId,                  // 任务ID
       recordId: state.recordId,              // 历史记录ID
+      seriesContext: state.seriesContext,
       content: state.content,                // 生成的内容（标题、文案、标签）
       outlineStatus: state.outlineStatus,    // 大纲生成状态
       lastSavedAt: state.lastSavedAt         // 最后保存时间
@@ -195,6 +200,8 @@ export const useGeneratorStore = defineStore('generator', {
       // 历史记录ID
       recordId: saved.recordId || null,
 
+      seriesContext: saved.seriesContext || {},
+
       // 用户上传的参考图片（不从 localStorage 恢复）
       userImages: [],
 
@@ -226,6 +233,7 @@ export const useGeneratorStore = defineStore('generator', {
       this.images = []
       this.taskId = null
       this.recordId = null
+      this.seriesContext = {}
       this.userImages = userImages
       this.content = createEmptyContent()
       this.outlineStatus = 'done'
@@ -241,6 +249,7 @@ export const useGeneratorStore = defineStore('generator', {
       this.topic = work.topic
       this.outline = work.outline
       this.recordId = work.recordId
+      this.seriesContext = { ...(work.seriesContext || {}) }
       this.taskId = work.taskId || null
       this.images = work.images || []
       this.progress = work.progress || createEmptyProgress()
@@ -265,6 +274,13 @@ export const useGeneratorStore = defineStore('generator', {
 
     isCurrentWork(version: number) {
       return version === this.workVersion
+    },
+
+    getSeriesRequestContext(): SeriesRequestContext {
+      return {
+        ...this.seriesContext,
+        ...(this.recordId ? { record_id: this.recordId } : {})
+      }
     },
 
     requestFreshImageGeneration() {
@@ -562,6 +578,7 @@ export const useGeneratorStore = defineStore('generator', {
 
       // 清空历史记录ID
       this.recordId = null
+      this.seriesContext = {}
 
       // 清空用户上传的参考图片
       this.userImages = []
@@ -711,6 +728,7 @@ export function setupAutoSave() {
       images: store.images,                  // 生成的图片结果
       taskId: store.taskId,                  // 任务ID
       recordId: store.recordId,              // 历史记录ID
+      seriesContext: store.seriesContext,
       content: store.content,                // 生成的内容
       outlineStatus: store.outlineStatus,    // 大纲生成状态
       lastSavedAt: store.lastSavedAt         // 最后保存时间

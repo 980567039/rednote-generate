@@ -41,8 +41,8 @@ def create_publish_blueprint(publish_service=None):
     @publish_bp.route("/publish/auth/check", methods=["POST"])
     def check_publish_auth():
         try:
-            result = service.auth_check()
-            status = int(result.pop("status", 200))
+            result = dict(service.auth_check())
+            status = int(result.pop("status", 200 if result.get("success") else 502))
             return jsonify(result), status
         except Exception as exc:
             return api_error_response(exc, context={"endpoint": "/api/publish/auth/check"})
@@ -50,7 +50,7 @@ def create_publish_blueprint(publish_service=None):
     @publish_bp.route("/publish/auth/login", methods=["POST"])
     def start_publish_login():
         try:
-            result = service.auth_login()
+            result = dict(service.auth_login())
             status = int(result.pop("status", 200 if result.get("success") else 502))
             return jsonify(result), status
         except Exception as exc:
@@ -111,6 +111,16 @@ def create_publish_blueprint(publish_service=None):
             return _publish_error(exc, {"endpoint": "/api/publish/tasks/<task_id>/confirm", "task_id": task_id})
         except Exception as exc:
             return api_error_response(exc, context={"endpoint": "/api/publish/tasks/<task_id>/confirm", "task_id": task_id})
+
+    @publish_bp.route("/publish/tasks/<task_id>/cancel", methods=["POST"])
+    def cancel_publish_task(task_id: str):
+        try:
+            task = service.cancel_task(task_id)
+            return jsonify({"success": True, "task": task, "message": "发布任务已停止"})
+        except PublishServiceError as exc:
+            return _publish_error(exc, {"endpoint": "/api/publish/tasks/<task_id>/cancel", "task_id": task_id})
+        except Exception as exc:
+            return api_error_response(exc, context={"endpoint": "/api/publish/tasks/<task_id>/cancel", "task_id": task_id})
 
     return publish_bp
 

@@ -135,7 +135,7 @@ function inferSuggestion(message: string): string {
     PROXY_UNAVAILABLE: '请确认代理客户端已开启，且 HTTP/HTTPS 代理端口正在监听。',
     NETWORK_FAKE_IP_TLS: '请确认代理客户端已开启，或关闭 Fake-IP DNS 后重试。',
     MODEL_ENDPOINT_MISMATCH: '请在设置中换成支持当前接口的模型，或调整服务商 endpoint_type。',
-    ENDPOINT_METHOD_MISMATCH: '请确认该服务商支持 OpenAI 兼容接口，并检查 Base URL、/v1 路径和 endpoint_type。',
+    ENDPOINT_METHOD_MISMATCH: '请重启后端服务以加载最新路由；如果仍失败，再检查接口路径和请求方法。',
     AUTH_OR_PERMISSION: '请检查 API Key、模型访问权限、账户余额和服务商配置。',
     RATE_LIMITED: '请稍后重试，或降低并发/检查账户配额。',
     NETWORK_TIMEOUT: '请检查网络、代理和服务商状态后重试。',

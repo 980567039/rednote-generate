@@ -21,9 +21,15 @@ export function getApiErrorPayload(error: unknown, fallback: string): {
       }
     }
     const data = error.response.data || {}
-    const message = data.error_message || fallback
+    const isObjectPayload = typeof data === 'object'
+    const status = error.response.status
+    const message = isObjectPayload && data.error_message
+      ? data.error_message
+      : status === 405
+        ? `接口请求方法不匹配（HTTP ${status}），后端可能尚未加载最新路由`
+        : fallback
     return {
-      error: data.error || message,
+      error: isObjectPayload && data.error ? data.error : message,
       error_message: message
     }
   }

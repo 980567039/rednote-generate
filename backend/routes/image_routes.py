@@ -16,6 +16,8 @@ import logging
 from flask import Blueprint, request, jsonify, Response, send_file
 from backend.errors import ensure_app_error
 from backend.services.image import ActiveGenerationError, get_image_service
+from backend.services.history import get_history_service
+from backend.services.series import build_context, get_template, series_context_from_payload
 from .utils import (
     api_error_response,
     log_request,
@@ -25,6 +27,63 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _template_id_from_record(record_id):
+    if not record_id:
+        return None, None
+    try:
+        record = get_history_service().get_record(record_id)
+    except Exception:
+        return None, None
+    if not record:
+        return None, None
+    return record.get("series_template_id"), record
+
+
+def _series_context_for_request(data, record_id=None, topic=""):
+    """优先使用历史快照，其次项目条目快照，最后才读取当前模板。"""
+    result = {
+        "series_id": data.get("series_id"),
+        "series_template_id": data.get("series_template_id"),
+        "series_item_index": data.get("series_item_index"),
+        "series_item_title": data.get("series_item_title"),
+        "content_mode": data.get("content_mode"),
+    }
+    record = None
+    if record_id:
+        try:
+            record = get_history_service().get_record(record_id)
+        except Exception:
+            record = None
+    snapshot = (record or {}).get("series_template_snapshot")
+    if snapshot:
+        result.update({
+            "series_id": record.get("series_id"),
+            "series_project_id": record.get("series_project_id") or record.get("series_id"),
+            "series_item_id": record.get("series_item_id"),
+            "series_template_id": snapshot.get("id"),
+            "series_item_index": record.get("series_item_index"),
+            "series_item_title": record.get("series_item_title") or topic,
+            "content_mode": record.get("series_content_mode", snapshot.get("content_mode", "story")),
+            "series_context": record.get("series_context_snapshot") or build_context(snapshot, topic, record.get("series_item_index"), record.get("series_content_mode", snapshot.get("content_mode", "story")))["series_context"],
+            "series_template": snapshot,
+        })
+        return result
+    if data.get("series_project_id") and data.get("series_item_id"):
+        result.update(series_context_from_payload(data))
+        return result
+    template_id = data.get("series_template_id") or (record or {}).get("series_template_id")
+    template = get_template(template_id) if template_id else None
+    if template:
+        result.update(build_context(
+            template,
+            data.get("series_item_title") or (record or {}).get("series_item_title") or topic,
+            data.get("series_item_index") if data.get("series_item_index") is not None else (record or {}).get("series_item_index"),
+            data.get("content_mode", (record or {}).get("series_content_mode", "story")),
+        ))
+        result["series_id"] = data.get("series_id") or (record or {}).get("series_id")
+    return result
 
 
 def create_image_blueprint():
@@ -59,6 +118,7 @@ def create_image_blueprint():
             force = bool(data.get('force', False))
             full_outline = data.get('full_outline', '')
             user_topic = data.get('user_topic', '')
+            series_kwargs = _series_context_for_request(data, record_id, user_topic)
 
             # 解析 base64 格式的用户参考图片
             user_images = _parse_base64_images(data.get('user_images', []))
@@ -86,6 +146,7 @@ def create_image_blueprint():
                     task_id=task_id,
                     record_id=record_id,
                     force=force,
+                    **series_kwargs,
                 )
             except ActiveGenerationError as exc:
                 return jsonify({
@@ -117,6 +178,7 @@ def create_image_blueprint():
                     force=force,
                     prepared=True,
                     cached=reservation["cached"],
+                    **series_kwargs,
                 ):
                     event_type = event["event"]
                     event_data = _normalize_sse_error(
@@ -222,6 +284,7 @@ def create_image_blueprint():
             page = data.get('page')
             use_reference = data.get('use_reference', True)
             record_id = data.get('record_id')
+            series_context = _series_context_for_request(data, record_id).get("series_context", "")
 
             log_request('/retry', {
                 'task_id': task_id,
@@ -243,6 +306,7 @@ def create_image_blueprint():
                 page,
                 use_reference,
                 record_id=record_id,
+                series_context=series_context,
             )
 
             if result["success"]:
@@ -278,6 +342,7 @@ def create_image_blueprint():
             task_id = data.get('task_id')
             pages = data.get('pages')
             record_id = data.get('record_id')
+            series_context = _series_context_for_request(data, record_id).get("series_context", "")
 
             log_request('/retry-failed', {
                 'task_id': task_id,
@@ -297,7 +362,9 @@ def create_image_blueprint():
 
             def generate():
                 """SSE 事件生成器"""
-                for event in image_service.retry_failed_images(task_id, pages, record_id=record_id):
+                for event in image_service.retry_failed_images(
+                    task_id, pages, record_id=record_id, series_context=series_context
+                ):
                     event_type = event["event"]
                     event_data = _normalize_sse_error(
                         event_type,
@@ -351,6 +418,7 @@ def create_image_blueprint():
             user_topic = data.get('user_topic', '')
             record_id = data.get('record_id')
             revision_request = data.get('revision_request', '')
+            series_context = _series_context_for_request(data, record_id, user_topic).get("series_context", "")
             if not isinstance(revision_request, str):
                 revision_request = ''
             revision_request = revision_request.strip()[:500]
@@ -375,7 +443,8 @@ def create_image_blueprint():
                 full_outline=full_outline,
                 user_topic=user_topic,
                 record_id=record_id,
-                revision_request=revision_request
+                revision_request=revision_request,
+                series_context=series_context,
             )
 
             if result["success"]:

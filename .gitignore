@@ -54,6 +54,11 @@ history/*
 # 但保留 .gitkeep 文件以保持目录结构
 !history/.gitkeep
 
+# Local-only series templates, project state, and reference images
+series_templates.json
+series_projects.json
+series/*/references/*
+
 # API configurations (contain API keys)
 .gemini/
 /image_providers.yaml

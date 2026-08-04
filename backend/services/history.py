@@ -224,7 +224,18 @@ class HistoryService:
         self,
         topic: str,
         outline: Dict,
-        task_id: Optional[str] = None
+        task_id: Optional[str] = None,
+        series_id: Optional[str] = None,
+        series_project_id: Optional[str] = None,
+        series_template_id: Optional[str] = None,
+        series_item_index: Optional[int] = None,
+        series_item_title: Optional[str] = None,
+        series_item_id: Optional[str] = None,
+        series_template_revision: Optional[int] = None,
+        series_template_snapshot: Optional[Dict[str, Any]] = None,
+        series_context_snapshot: Optional[str] = None,
+        series_topic_source: Optional[str] = None,
+        series_content_mode: Optional[str] = None,
     ) -> str:
         """
         创建新的历史记录
@@ -262,6 +273,29 @@ class HistoryService:
                 "status": RecordStatus.DRAFT,  # 初始状态：草稿
                 "thumbnail": None  # 初始无缩略图
             }
+            # 系列元数据是可选的；旧历史记录和自由创作不需要迁移。
+            if series_id is not None:
+                record["series_id"] = series_id
+            if series_project_id is not None:
+                record["series_project_id"] = series_project_id
+            if series_template_id is not None:
+                record["series_template_id"] = series_template_id
+            if series_item_index is not None:
+                record["series_item_index"] = series_item_index
+            if series_item_title is not None:
+                record["series_item_title"] = series_item_title
+            if series_item_id is not None:
+                record["series_item_id"] = series_item_id
+            if series_template_revision is not None:
+                record["series_template_revision"] = series_template_revision
+            if series_template_snapshot is not None:
+                record["series_template_snapshot"] = series_template_snapshot
+            if series_context_snapshot is not None:
+                record["series_context_snapshot"] = series_context_snapshot
+            if series_topic_source is not None:
+                record["series_topic_source"] = series_topic_source
+            if series_content_mode is not None:
+                record["series_content_mode"] = series_content_mode
 
             # 保存完整记录到独立文件
             record_path = self._get_record_path(record_id)
@@ -269,7 +303,7 @@ class HistoryService:
 
             # 更新索引（用于快速列表查询）
             index = self._load_index()
-            index["records"].insert(0, {
+            index_entry = {
                 "id": record_id,
                 "title": topic,
                 "created_at": now,
@@ -278,7 +312,19 @@ class HistoryService:
                 "thumbnail": None,
                 "page_count": len(outline.get("pages", [])),  # 预期页数
                 "task_id": task_id
-            })
+            }
+            if series_id is not None:
+                index_entry.update({
+                    "series_id": series_id,
+                    "series_project_id": series_project_id,
+                    "series_template_id": series_template_id,
+                    "series_item_index": series_item_index,
+                    "series_item_title": series_item_title,
+                    "series_item_id": series_item_id,
+                    "series_template_revision": series_template_revision,
+                    "series_content_mode": series_content_mode,
+                })
+            index["records"].insert(0, index_entry)
             self._save_index(index)
 
             return record_id

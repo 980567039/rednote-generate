@@ -40,10 +40,22 @@
           <span>旅游攻略</span>
           <small>按目的地生成游览路线</small>
         </button>
+        <button
+          type="button"
+          class="creation-mode-option"
+          :class="{ active: creationMode === 'series' }"
+          :aria-pressed="creationMode === 'series'"
+          :disabled="loading"
+          @click="creationMode = 'series'"
+        >
+          <span>系列合集</span>
+          <small>统一模板批量生成多篇内容</small>
+        </button>
       </div>
 
       <!-- 主题输入组合框 -->
       <ComposerInput
+        v-if="creationMode !== 'series'"
         ref="composerRef"
         v-model="topic"
         v-model:creative-brief="creativeBrief"
@@ -107,6 +119,7 @@
           <small>{{ preset.description }}</small>
         </button>
       </div>
+      <SeriesSetupPanel v-if="creationMode === 'series'" />
     </div>
 
     <ErrorCard
@@ -120,8 +133,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onMounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useGeneratorStore } from '../stores/generator'
 import { generateOutline, createHistory } from '../api'
 import { normalizeApiError, type AppError } from '../utils/errors'
@@ -130,8 +143,10 @@ import { normalizeApiError, type AppError } from '../utils/errors'
 import ShowcaseBackground from '../components/home/ShowcaseBackground.vue'
 import ComposerInput from '../components/home/ComposerInput.vue'
 import ErrorCard from '../components/common/ErrorCard.vue'
+import SeriesSetupPanel from '../components/home/SeriesSetupPanel.vue'
 
 const router = useRouter()
+const route = useRoute()
 const store = useGeneratorStore()
 
 // 状态
@@ -141,7 +156,7 @@ const loading = ref(false)
 const error = ref<AppError | null>(null)
 const composerRef = ref<InstanceType<typeof ComposerInput> | null>(null)
 type StructurePresetId = 'standard' | 'comparison_two' | 'comparison_four'
-type CreationMode = 'free' | 'travel'
+type CreationMode = 'free' | 'travel' | 'series'
 type TravelDuration = 'half_day' | 'one_day' | 'two_days'
 
 const creationMode = ref<CreationMode>('free')
@@ -178,7 +193,9 @@ const structurePresets: Array<{
 
 const modeDescription = computed(() => creationMode.value === 'travel'
   ? '输入目的地和旅行偏好，让 AI 规划适合发布的小红书旅游攻略'
-  : '输入你的创意主题，让 AI 帮你生成标题、正文和配图')
+  : creationMode.value === 'series'
+    ? '锁定统一视觉、角色和页面结构，批量制作一套连续的小红书内容'
+    : '输入你的创意主题，让 AI 帮你生成标题、正文和配图')
 
 const composerPlaceholder = computed(() => creationMode.value === 'travel'
   ? '输入目的地，例如：北京故宫、杭州西湖、上海迪士尼'
@@ -224,6 +241,10 @@ function topicForGeneration(rawInput: string, brief: string) {
 
 // 上传的图片文件
 const uploadedImageFiles = ref<File[]>([])
+
+onMounted(() => {
+  if (route.query.mode === 'series') creationMode.value = 'series'
+})
 
 /**
  * 处理图片变化
@@ -421,7 +442,7 @@ async function handleGenerate() {
 
 .creation-mode-selector {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   width: min(100%, 560px);
   margin: 0 auto 14px;

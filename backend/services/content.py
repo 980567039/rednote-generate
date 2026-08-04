@@ -131,10 +131,74 @@ class ContentService:
         logger.error(f"无法解析 JSON 响应: {response_text[:200]}...")
         raise ValueError("AI 返回的内容格式不正确，无法解析")
 
+    def generate_series_topic_suggestions(
+        self,
+        series_context: str,
+        existing_topics: List[str],
+        allow_third_party_ip: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """按系列规则生成 5 个候选主题；候选本身不会写入合集。"""
+        existing = [str(topic).strip() for topic in existing_topics if str(topic).strip()]
+        ip_rule = (
+            "可以包含第三方动漫、影视、游戏或品牌 IP 方向，但必须把 uses_ip 标为 true，"
+            "不得声称官方授权或合作。"
+            if allow_third_party_ip
+            else "只允许原创人物、原创世界观和通用题材；不得出现第三方动漫、影视、游戏、品牌或真实人物 IP，uses_ip 必须为 false。"
+        )
+        prompt = "\n".join([
+            "你是小红书长期系列的选题编辑。请根据下面的系列硬约束生成恰好 5 个可独立成篇的新主题。",
+            series_context,
+            f"已有主题（不得重复或仅换同义词）：{json.dumps(existing[-200:], ensure_ascii=False)}",
+            ip_rule,
+            "要求：主题具体、有画面或剧情空间，彼此差异明显；不要把视觉风格本身当作主题；每个理由不超过 40 字。",
+            '只输出 JSON 对象：{"suggestions":[{"topic":"...","reason":"...","uses_ip":false}]}。',
+        ])
+        active_provider = self.text_config.get('active_provider', 'google_gemini')
+        provider_config = self.text_config.get('providers', {}).get(active_provider, {})
+        response_text = self.client.generate_text(
+            prompt=prompt,
+            model=provider_config.get('model', 'gemini-2.0-flash-exp'),
+            temperature=provider_config.get('temperature', 1.0),
+            max_output_tokens=min(int(provider_config.get('max_output_tokens', 4000)), 4000),
+        )
+        parsed = self._parse_json_response(response_text)
+        raw_items = parsed.get("suggestions")
+        if not isinstance(raw_items, list):
+            raise ValueError("AI 未返回 suggestions 数组")
+
+        existing_keys = {re.sub(r"\s+", " ", topic).strip().casefold() for topic in existing}
+        seen = set(existing_keys)
+        suggestions: List[Dict[str, Any]] = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            topic = re.sub(r"\s+", " ", str(raw.get("topic") or "")).strip()[:200]
+            reason = re.sub(r"\s+", " ", str(raw.get("reason") or "")).strip()[:200]
+            raw_uses_ip = raw.get("uses_ip", False)
+            uses_ip = raw_uses_ip is True or (
+                isinstance(raw_uses_ip, str) and raw_uses_ip.strip().lower() in {"true", "1", "yes"}
+            )
+            key = topic.casefold()
+            if not topic or key in seen or (uses_ip and not allow_third_party_ip):
+                continue
+            suggestions.append({"topic": topic, "reason": reason, "uses_ip": uses_ip})
+            seen.add(key)
+            if len(suggestions) == 5:
+                break
+        if len(suggestions) != 5:
+            raise ValueError("AI 返回的有效候选不足 5 个")
+        return suggestions
+
     def generate_content(
         self,
         topic: str,
-        outline: str
+        outline: str,
+        series_context: str = "",
+        series_template: Optional[Dict[str, Any]] = None,
+        series_item_index: Optional[int] = None,
+        series_item_title: Optional[str] = None,
+        content_mode: str = "story",
+        **_: Any,
     ) -> Dict[str, Any]:
         """
         生成标题、文案和标签
@@ -154,6 +218,21 @@ class ContentService:
                 topic=topic,
                 outline=outline
             )
+            if series_context:
+                prompt += (
+                    "\n\n" + series_context +
+                    "\n【系列文案校验要求】标题、正文和标签必须保持系列文案口吻；"
+                    "不得声称第三方 IP 获得官方授权或合作。"
+                )
+                if content_mode == "character_sheet" or "内容方向：精细角色图" in series_context:
+                    prompt += (
+                        "\n【精细角色图文案要求】这不是剧情故事，不要编写事件经过、连续情节或虚构冒险；"
+                        "标题、正文和标签只介绍角色阵容、外观亮点、像素风设定和创作备注，"
+                        "正文保持短小，明确这是单张角色设定图。"
+                    )
+            elif series_template:
+                from backend.services.series import build_context
+                prompt += "\n\n" + build_context(series_template, series_item_title or topic, series_item_index)["series_context"]
 
             # 从配置中获取模型参数
             active_provider = self.text_config.get('active_provider', 'google_gemini')

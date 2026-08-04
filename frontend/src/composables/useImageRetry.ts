@@ -33,7 +33,8 @@ export function useImageRetry(setError: (error: AppError | null) => void) {
     const context = {
       fullOutline: store.outline.raw || '',
       userTopic: store.topic || '',
-      recordId: store.recordId
+      recordId: store.recordId,
+      series: store.getSeriesRequestContext()
     }
 
     apiRegenerateImage(store.taskId, page, true, context)
@@ -106,7 +107,8 @@ export function useImageRetry(setError: (error: AppError | null) => void) {
           console.error('重试失败:', err)
           setError(normalizeApiError(err, '补图失败'))
         },
-        store.recordId
+        store.recordId,
+        store.getSeriesRequestContext()
       )
     } catch (e) {
       setError(normalizeApiError(e, '补图失败'))

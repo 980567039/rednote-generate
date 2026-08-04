@@ -5,6 +5,8 @@ import GenerateView from '../views/GenerateView.vue'
 import ResultView from '../views/ResultView.vue'
 import HistoryView from '../views/HistoryView.vue'
 import SettingsView from '../views/SettingsView.vue'
+import SeriesView from '../views/SeriesView.vue'
+import SeriesListView from '../views/SeriesListView.vue'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -43,6 +45,16 @@ const router = createRouter({
       path: '/settings',
       name: 'settings',
       component: SettingsView
+    },
+    {
+      path: '/series',
+      name: 'series-list',
+      component: SeriesListView
+    },
+    {
+      path: '/series/:id',
+      name: 'series-project',
+      component: SeriesView
     }
   ]
 })

@@ -182,7 +182,8 @@ async function handleGenerate() {
   const recordId = store.recordId
 
   try {
-    const result = await generateContent(topic, outline)
+    // record_id 始终随请求发送；系列作品同时携带模板/子主题规则上下文。
+    const result = await generateContent(topic, outline, store.getSeriesRequestContext())
 
     // 用户已开始另一件作品时，忽略旧请求的迟到响应。
     if (!store.isCurrentWork(workVersion)) return

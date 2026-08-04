@@ -55,6 +55,13 @@ export interface HistoryRecord {
   thumbnail: string | null
   page_count: number
   task_id: string | null
+  series_id?: string | null
+  series_template_id?: string | null
+  series_project_id?: string | null
+  series_item_id?: string | null
+  series_item_index?: number | null
+  series_item_title?: string | null
+  series_content_mode?: SeriesContentMode | string | null
 }
 
 export interface HistoryDetail {
@@ -79,12 +86,25 @@ export interface HistoryDetail {
   }
   status: string
   thumbnail: string | null
+  series_id?: string | null
+  series_template_id?: string | null
+  series_project_id?: string | null
+  series_item_id?: string | null
+  series_item_index?: number | null
+  series_item_title?: string | null
+  series_content_mode?: SeriesContentMode | string | null
 }
 
 export interface CreateHistoryParams {
   topic: string
   outline: { raw: string; pages: Page[] }
   task_id?: string
+  series_id?: string
+  series_template_id?: string
+  series_project_id?: string
+  series_item_id?: string
+  series_item_index?: number
+  series_item_title?: string
 }
 
 export interface UpdateHistoryParams {
@@ -121,6 +141,17 @@ export interface ContentResponse {
   error_message?: string
 }
 
+export interface SeriesRequestContext {
+  record_id?: string
+  series_id?: string
+  series_template_id?: string
+  series_project_id?: string
+  series_item_id?: string
+  series_item_index?: number
+  series_item_title?: string
+  content_mode?: SeriesContentMode
+}
+
 export type PublishMode = 'preview' | 'auto'
 
 export type PublishTaskStatus =
@@ -138,6 +169,7 @@ export type PublishTaskStatus =
   | 'published'
   | 'failed'
   | 'unknown'
+  | 'cancelled'
 
 export interface PublishConfig {
   account: string
@@ -171,6 +203,9 @@ export interface PublishApiResponse {
   logged_in?: boolean
   authenticated?: boolean
   login_started?: boolean
+  login_url?: string
+  qrcode_data_url?: string
+  mime_type?: string
   output?: string
   returncode?: number
   config?: PublishConfig
@@ -178,3 +213,108 @@ export interface PublishApiResponse {
   error?: AppError | string
   error_message?: string
 }
+
+export type SeriesStructurePreset = 'standard' | 'comparison_two' | 'comparison_four'
+
+export interface SeriesPageStructure {
+  preset: SeriesStructurePreset
+  page_count: number
+}
+
+export interface SeriesTemplate {
+  id: string
+  name: string
+  description: string
+  visual_style: string
+  palette: string
+  composition: string
+  character_bible: string
+  copy_tone: string
+  prohibited_elements: string | string[]
+  page_structure: SeriesPageStructure
+  ip_notice: string
+  reference_images: string[]
+  revision?: number
+  created_at?: string
+  updated_at?: string
+}
+
+export type SeriesTemplateSnapshot = Omit<SeriesTemplate, 'created_at' | 'updated_at'> & {
+  captured_at?: string
+}
+
+export interface SeriesProjectItem {
+  id: string
+  index: number
+  topic: string
+  content_mode?: SeriesContentMode
+  character_names?: string[]
+  topic_source?: 'user' | 'system' | 'user_modified_system' | string
+  ip_acknowledged?: boolean
+  record_id: string | null
+  outline: string
+  pages: Page[]
+  status: string
+  outline_status?: string
+  template_revision?: number
+  template_snapshot?: SeriesTemplateSnapshot
+  error?: AppError | string
+  error_message?: string
+  progress?: SeriesProjectProgress | number
+}
+
+export type SeriesContentMode = 'story' | 'character_sheet'
+
+export interface SeriesProjectProgress {
+  current: number
+  total: number
+  percent?: number
+  message?: string
+}
+
+export interface SeriesProject {
+  id: string
+  name: string
+  template_id: string
+  topics: string[]
+  items: SeriesProjectItem[]
+  content_mode?: SeriesContentMode
+  status: string
+  progress: SeriesProjectProgress | number
+  template?: SeriesTemplate
+  item_count?: number
+  status_counts?: Record<string, number>
+  created_at?: string
+  updated_at?: string
+}
+
+export interface SeriesApiResponse {
+  success: boolean
+  template?: SeriesTemplate
+  templates?: SeriesTemplate[]
+  project?: SeriesProject
+  projects?: SeriesProject[]
+  message?: string
+  error?: AppError | string
+  error_message?: string
+  tasks?: Array<Record<string, unknown>>
+  item?: SeriesProjectItem
+  deleted_item?: SeriesProjectItem
+  items?: SeriesProjectItem[]
+  suggestions?: SeriesTopicSuggestion[]
+  page?: number
+  page_size?: number
+  total?: number
+  total_pages?: number
+  status_counts?: Record<string, number>
+  source?: 'model' | 'fallback' | string
+  warning?: string | null
+}
+
+export interface SeriesTopicSuggestion {
+  topic: string
+  reason?: string
+  uses_ip?: boolean
+}
+
+export type CreateSeriesTemplateInput = Omit<SeriesTemplate, 'id' | 'created_at' | 'updated_at'>

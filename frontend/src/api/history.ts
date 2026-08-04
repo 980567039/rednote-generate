@@ -7,6 +7,7 @@ import type {
   HistoryDetail,
   HistoryRecord,
   Page,
+  SeriesRequestContext,
   UpdateHistoryParams
 } from './types'
 import type { AppError } from '../utils/errors'
@@ -14,7 +15,8 @@ import type { AppError } from '../utils/errors'
 export async function createHistory(
   topic: string,
   outline: { raw: string; pages: Page[] },
-  taskId?: string
+  taskId?: string,
+  series?: SeriesRequestContext
 ): Promise<{ success: boolean; record_id?: string; error?: AppError | string; error_message?: string }> {
   try {
     const response = await axios.post(
@@ -22,7 +24,8 @@ export async function createHistory(
       {
         topic,
         outline,
-        task_id: taskId
+        task_id: taskId,
+        ...(series || {})
       },
       {
         timeout: 10000

@@ -10,6 +10,7 @@ import base64
 import logging
 from flask import Blueprint, request, jsonify
 from backend.services.outline import get_outline_service
+from backend.services.series import build_context, get_template, series_context_from_payload
 from .utils import (
     api_error_response,
     log_request,
@@ -62,8 +63,27 @@ def create_outline_blueprint():
 
             # 调用大纲生成服务
             logger.info(f"🔄 开始生成大纲，主题: {topic[:50]}...")
+            data = request.form if request.content_type and 'multipart/form-data' in request.content_type else (request.get_json(silent=True) or {})
+            series_template_id = data.get('series_template_id')
+            series_project_id = data.get('series_project_id')
+            series_item_index = data.get('series_item_index')
+            series_item_title = data.get('series_item_title')
+            series_kwargs = {
+                "series_id": data.get("series_id"),
+                "series_template_id": series_template_id,
+                "series_item_index": series_item_index,
+                "series_item_title": series_item_title,
+                "content_mode": data.get("content_mode"),
+            }
+            if series_project_id and data.get("series_item_id"):
+                series_kwargs.update(series_context_from_payload(dict(data)))
+            else:
+                template = get_template(series_template_id) if series_template_id else None
+                if template:
+                    series_kwargs.update(build_context(template, series_item_title or topic, series_item_index, data.get("content_mode", "story")))
+
             outline_service = get_outline_service()
-            result = outline_service.generate_outline(topic, images if images else None)
+            result = outline_service.generate_outline(topic, images if images else None, **series_kwargs)
 
             # 记录结果
             elapsed = time.time() - start_time

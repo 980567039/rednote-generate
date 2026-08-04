@@ -146,7 +146,7 @@
             <button
               class="btn btn-secondary btn-small"
               type="button"
-              :disabled="publishCheckingAuth || !publishConfig.publisher_available"
+              :disabled="publishCheckingAuth || publishOpeningLogin || !publishConfig.publisher_available"
               @click="checkPublishAuth"
             >
               {{ publishCheckingAuth ? '检查中…' : '检查登录' }}
@@ -154,7 +154,7 @@
             <button
               class="btn btn-secondary btn-small"
               type="button"
-              :disabled="publishOpeningLogin || !publishConfig.publisher_available"
+              :disabled="publishCheckingAuth || publishOpeningLogin || !publishConfig.publisher_available"
               @click="startPublishLogin"
             >
               {{ publishOpeningLogin ? '打开中…' : '打开登录页' }}
@@ -366,11 +366,14 @@ async function savePublishSettings() {
 }
 
 async function checkPublishAuth() {
+  if (publishCheckingAuth.value || publishOpeningLogin.value) return
   publishCheckingAuth.value = true
   publishError.value = null
+  publishAuthMessage.value = '正在检查小红书登录状态…'
   try {
     const result = await checkPublishLogin()
     if (result.success) {
+      publishError.value = null
       publishLoggedIn.value = result.logged_in === true || result.authenticated === true
       publishAuthMessage.value = result.message || (publishLoggedIn.value ? '已登录小红书' : '未登录，请打开登录页扫码')
     } else {
@@ -383,11 +386,17 @@ async function checkPublishAuth() {
 }
 
 async function startPublishLogin() {
+  if (publishCheckingAuth.value || publishOpeningLogin.value) return
   publishOpeningLogin.value = true
   publishError.value = null
+  publishAuthMessage.value = '正在唤起 Chrome 登录页，首次启动可能需要十几秒，请勿重复点击。'
   try {
     const result = await openPublishLogin()
     if (result.success) {
+      publishError.value = null
+      if (result.logged_in !== undefined || result.authenticated !== undefined) {
+        publishLoggedIn.value = result.logged_in === true || result.authenticated === true
+      }
       publishAuthMessage.value = result.message || '登录页已打开，请在浏览器登录后重新检查'
     } else {
       publishError.value = normalizeApiError(result.error || result.error_message || '打开登录页失败', '打开登录页失败')

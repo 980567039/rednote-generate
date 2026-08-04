@@ -139,7 +139,8 @@ export function useGenerationRunner(
         store.topic,
         store.recordId,
         force,
-        abortController.signal
+        abortController.signal,
+        store.getSeriesRequestContext()
       )
     })().finally(() => {
       if (token === runToken) {
