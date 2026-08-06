@@ -107,6 +107,44 @@ export async function updateHistory(
   }
 }
 
+export async function appendPatternPage(
+  recordId: string,
+  input: {
+    requestId: string
+    sourceImageIndex: number
+    columns: number
+    rows: number
+    usedColors: number
+    pattern: Blob
+  }
+): Promise<{
+  success: boolean
+  appended?: boolean
+  page_index?: number
+  filename?: string
+  record?: HistoryDetail
+  error?: AppError | string
+  error_message?: string
+}> {
+  const formData = new FormData()
+  formData.append('request_id', input.requestId)
+  formData.append('source_image_index', String(input.sourceImageIndex))
+  formData.append('columns', String(input.columns))
+  formData.append('rows', String(input.rows))
+  formData.append('used_colors', String(input.usedColors))
+  formData.append('pattern', input.pattern, 'perler-master.png')
+  try {
+    const response = await axios.post(
+      `${API_BASE_URL}/history/${encodeURIComponent(recordId)}/pattern-pages`,
+      formData,
+      { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 60000 }
+    )
+    return response.data
+  } catch (error: any) {
+    return { success: false, ...getApiErrorPayload(error, '追加拼豆图纸失败') }
+  }
+}
+
 export async function checkHistoryExists(recordId: string): Promise<boolean> {
   try {
     const response = await axios.get(

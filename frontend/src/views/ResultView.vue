@@ -72,6 +72,15 @@
                 </svg>
                 重新生成
               </button>
+              <button
+                v-if="canCreatePattern(image)"
+                class="hover-action-btn"
+                type="button"
+                :disabled="patternGeneratingIndex === image.index"
+                @click.stop="generatePattern(image)"
+              >
+                {{ patternGeneratingIndex === image.index ? '生成图纸中…' : '生成拼豆图纸' }}
+              </button>
             </div>
           </div>
 
@@ -83,9 +92,18 @@
                 style="border: none; background: none; color: var(--text-sub); cursor: pointer; display: flex; align-items: center;"
                 title="重新生成此图"
                 @click="openRegenerateDialog(image)"
-                :disabled="regeneratingIndex === image.index"
+                :disabled="regeneratingIndex === image.index || isPatternImage(image)"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+              </button>
+              <button
+                v-if="canCreatePattern(image)"
+                style="border: none; background: none; color: var(--primary); cursor: pointer; font-size: 12px;"
+                type="button"
+                :disabled="patternGeneratingIndex === image.index"
+                @click="generatePattern(image)"
+              >
+                {{ patternGeneratingIndex === image.index ? '生成中…' : '拼豆图纸' }}
               </button>
               <button
                 style="border: none; background: none; color: var(--primary); cursor: pointer; font-size: 12px;"
@@ -124,6 +142,18 @@
       :image-count="store.images.length"
       @close="showPublishModal = false"
     />
+    <div v-if="patternPending" class="pattern-confirm-backdrop" role="presentation" @click.self="cancelPatternAppend">
+      <section class="pattern-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="pattern-confirm-title">
+        <h2 id="pattern-confirm-title">拼豆图纸已生成</h2>
+        <p>是否将这张图纸追加到该子主题的最后一张图片？确认后才会写入历史记录和发布序列。</p>
+        <div class="pattern-confirm-actions">
+          <button class="btn btn-secondary" type="button" :disabled="isAppendingPattern" @click="cancelPatternAppend">暂不追加</button>
+          <button class="btn btn-primary" type="button" :disabled="isAppendingPattern" @click="confirmPatternAppend">
+            {{ isAppendingPattern ? '追加中…' : '确认追加' }}
+          </button>
+        </div>
+      </section>
+    </div>
   </div>
 </template>
 
@@ -186,19 +216,25 @@
 .result-actions-wrap { display: grid; justify-items: end; gap: 6px; }
 .result-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 12px; }
 .publish-disabled-hint { margin: 0; color: var(--text-secondary); font-size: 12px; }
+.pattern-confirm-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 20px; background: rgba(15, 23, 42, 0.46); }
+.pattern-confirm-modal { width: min(420px, 100%); padding: 24px; border: 1px solid var(--border-color); border-radius: 14px; background: var(--bg-card); box-shadow: 0 18px 60px rgba(15, 23, 42, 0.22); }
+.pattern-confirm-modal h2 { margin: 0 0 10px; color: var(--text-main); font-size: 18px; }
+.pattern-confirm-modal p { margin: 0; color: var(--text-sub); font-size: 13px; line-height: 1.6; }
+.pattern-confirm-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }
 </style>
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useGeneratorStore } from '../stores/generator'
-import { regenerateImage } from '../api'
+import { appendPatternPage, regenerateImage } from '../api'
 import ContentDisplay from '../components/result/ContentDisplay.vue'
 import ErrorCard from '../components/common/ErrorCard.vue'
 import ImagePreviewModal from '../components/common/ImagePreviewModal.vue'
 import RegenerateImageModal from '../components/common/RegenerateImageModal.vue'
 import PublishModal from '../components/result/PublishModal.vue'
 import { normalizeApiError, type AppError } from '../utils/errors'
+import { generatePatternWithPerler, type PerlerPatternResult } from '../integrations/perlerBridge'
 
 const router = useRouter()
 const store = useGeneratorStore()
@@ -207,6 +243,11 @@ const error = ref<AppError | null>(null)
 const previewImage = ref<{ src: string; alt: string } | null>(null)
 const regenerateTarget = ref<any | null>(null)
 const showPublishModal = ref(false)
+const patternGeneratingIndex = ref<number | null>(null)
+const isAppendingPattern = ref(false)
+const patternPending = ref<{ sourceImageIndex: number; result: PerlerPatternResult } | null>(null)
+
+
 
 const canPublish = computed(() => Boolean(
   store.recordId
@@ -221,6 +262,14 @@ const publishDisabledReason = computed(() => {
   if (!store.images.length || !store.images.every(image => image.status === 'done' && Boolean(image.url))) return '请等待全部图片生成完成'
   return ''
 })
+
+function isPatternImage(image: { index: number }) {
+  return store.outline.pages.find(page => page.index === image.index)?.type === 'pattern'
+}
+
+function canCreatePattern(image: { index: number; url: string }) {
+  return Boolean(store.recordId && image.url && !isPatternImage(image))
+}
 
 const viewImage = (url: string) => {
   const image = store.images.find(item => item.url === url)
@@ -262,6 +311,63 @@ const downloadAll = () => {
         }, index * 300)
       }
     })
+  }
+}
+
+const generatePattern = async (image: { index: number; url: string }) => {
+  if (!store.recordId || !canCreatePattern(image) || patternGeneratingIndex.value !== null) return
+  patternGeneratingIndex.value = image.index
+  error.value = null
+  try {
+    const result = await generatePatternWithPerler({
+      recordId: store.recordId,
+      imageIndex: image.index,
+      imageUrl: `${image.url.split('?')[0]}?thumbnail=false`,
+      fileName: `redink-page-${image.index + 1}.png`
+    })
+    patternPending.value = { sourceImageIndex: image.index, result }
+  } catch (reason: any) {
+    error.value = normalizeApiError(reason, '生成拼豆图纸失败')
+  } finally {
+    patternGeneratingIndex.value = null
+  }
+}
+
+const cancelPatternAppend = () => {
+  if (isAppendingPattern.value) return
+  patternPending.value = null
+}
+
+const confirmPatternAppend = async () => {
+  const pending = patternPending.value
+  if (!pending || !store.recordId || isAppendingPattern.value) return
+  isAppendingPattern.value = true
+  error.value = null
+  try {
+    const response = await appendPatternPage(store.recordId, {
+      requestId: pending.result.requestId,
+      sourceImageIndex: pending.sourceImageIndex,
+      columns: pending.result.metadata.columns,
+      rows: pending.result.metadata.rows,
+      usedColors: pending.result.metadata.usedColors,
+      pattern: pending.result.pattern
+    })
+    if (!response.success || !response.filename || !response.record?.outline.pages) {
+      error.value = normalizeApiError(response.error || response.error_message || '服务器未确认追加', '追加拼豆图纸失败')
+      return
+    }
+    const page = response.record.outline.pages[response.page_index ?? response.record.outline.pages.length - 1]
+    if (!page || page.type !== 'pattern') {
+      error.value = normalizeApiError('服务器返回的图纸页面无效', '追加拼豆图纸失败')
+      return
+    }
+    store.appendPatternImage(page, response.filename)
+    patternPending.value = null
+    error.value = null
+  } catch (reason: any) {
+    error.value = normalizeApiError(reason, '追加拼豆图纸失败')
+  } finally {
+    isAppendingPattern.value = false
   }
 }
 

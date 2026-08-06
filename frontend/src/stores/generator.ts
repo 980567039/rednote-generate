@@ -356,7 +356,7 @@ export const useGeneratorStore = defineStore('generator', {
      * @param type 页面类型：cover-封面, content-内容, summary-总结
      * @param content 页面内容，默认为空
      */
-    addPage(type: 'cover' | 'content' | 'summary', content: string = '') {
+    addPage(type: 'cover' | 'content' | 'summary' | 'pattern', content: string = '') {
       const newPage: Page = {
         index: this.outline.pages.length,
         type,
@@ -373,7 +373,7 @@ export const useGeneratorStore = defineStore('generator', {
      * @param type 页面类型
      * @param content 页面内容
      */
-    insertPage(afterIndex: number, type: 'cover' | 'content' | 'summary', content: string = '') {
+    insertPage(afterIndex: number, type: 'cover' | 'content' | 'summary' | 'pattern', content: string = '') {
       const newPage: Page = {
         index: afterIndex + 1,
         type,
@@ -494,6 +494,25 @@ export const useGeneratorStore = defineStore('generator', {
           this.progress.current++
         }
       }
+    },
+
+    appendPatternImage(page: Page, filename: string) {
+      if (!this.taskId || this.outline.pages.some(existing => existing.index === page.index)) return
+      this.outline.pages.push(page)
+      this.outline.pages.sort((first, second) => first.index - second.index)
+      this.syncRawFromPages()
+      this.images.push({
+        index: page.index,
+        url: `/api/images/${this.taskId}/${filename}?t=${Date.now()}`,
+        status: 'done'
+      })
+      this.images.sort((first, second) => first.index - second.index)
+      this.progress.total = this.outline.pages.length
+      this.progress.current = this.images.filter(image => image.status === 'done' && Boolean(image.url)).length
+      this.progress.status = 'done'
+      this.progress.phase = 'finished'
+      this.progress.message = '拼豆图纸已追加到最后一页'
+      this.stage = 'result'
     },
 
     /**

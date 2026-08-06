@@ -347,6 +347,11 @@ class ImageService:
         index = page["index"]
         page_type = page["type"]
         page_content = page["content"]
+        clean_pattern_source = (
+            "内容方向：精细角色图" in series_context
+            or "精细角色设定图" in page_content
+            or page_type == "pattern_source"
+        )
 
         try:
             if task_dir is None:
@@ -377,6 +382,13 @@ class ImageService:
                     "\n【系列图片硬约束】必须保持系列画风、色板、镜头语言和角色外观；"
                     "禁止改变系列页面数量与构图规则。文字只作辅助信息，禁止密集文字和禁用元素。"
                 )
+            if clean_pattern_source:
+                prompt += (
+                    "\n\n【拼豆源图硬约束】这张图将被转换为拼豆图纸，必须只保留一个清晰主体；"
+                    "禁止任何文字、标题、字幕、数字、边框、装饰贴纸、拼贴、统计信息和水印；"
+                    "主体占画面主要区域，使用有限色、大色块、清晰外轮廓和干净背景，避免细碎噪点、"
+                    "渐变纹理和多个独立小物件。画面优先输出适合 104×104 网格采样的高分辨率正方形源图。"
+                )
 
             # 调用生成器生成图片。所有路径共用 limiter，避免批量和重试打爆上游。
             with self.rate_limiter.acquire():
@@ -385,7 +397,11 @@ class ImageService:
                     google_reference = reference_image or (user_images[0] if user_images else None)
                     image_data = self.generator.generate_image(
                         prompt=prompt,
-                        aspect_ratio=self.provider_config.get('default_aspect_ratio', '3:4'),
+                        aspect_ratio=(
+                            self.provider_config.get('pattern_source_aspect_ratio', '1:1')
+                            if clean_pattern_source
+                            else self.provider_config.get('default_aspect_ratio', '3:4')
+                        ),
                         temperature=self.provider_config.get('temperature', 1.0),
                         model=self.provider_config.get('model', 'gemini-3-pro-image-preview'),
                         reference_image=google_reference,
@@ -402,7 +418,11 @@ class ImageService:
 
                     image_data = self.generator.generate_image(
                         prompt=prompt,
-                        aspect_ratio=self.provider_config.get('default_aspect_ratio', '3:4'),
+                        aspect_ratio=(
+                            self.provider_config.get('pattern_source_aspect_ratio', '1:1')
+                            if clean_pattern_source
+                            else self.provider_config.get('default_aspect_ratio', '3:4')
+                        ),
                         temperature=self.provider_config.get('temperature', 1.0),
                         model=self.provider_config.get('model', 'nano-banana-2'),
                         reference_images=reference_images if reference_images else None,

@@ -13,6 +13,7 @@ import os
 import io
 import zipfile
 import logging
+import re
 from flask import Blueprint, request, jsonify, send_file
 from backend.services.history import ContentStatus, get_history_service
 from .utils import api_error_response, normalize_error_result, validation_error
@@ -301,6 +302,60 @@ def create_history_blueprint():
 
         except Exception as e:
             return api_error_response(e, context={"endpoint": "/api/history/<id>", "record_id": record_id})
+
+    @history_bp.route('/history/<record_id>/pattern-pages', methods=['POST'])
+    def append_pattern_page(record_id):
+        """接收 Perler 母版；只有调用方明确确认后才会写入历史。"""
+        try:
+            request_id = (request.form.get('request_id') or '').strip()
+            if not re.fullmatch(r'[A-Za-z0-9._:-]{1,128}', request_id):
+                return api_error_response(
+                    validation_error("request_id 无效", "请重新发起拼豆图纸交接。"),
+                    context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id},
+                )
+
+            pattern_file = request.files.get('pattern')
+            if not pattern_file or not pattern_file.filename:
+                return api_error_response(
+                    validation_error("缺少 pattern 文件", "请先从 Perler 回传 PNG 母版。"),
+                    context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id},
+                )
+            image_data = pattern_file.read(20 * 1024 * 1024 + 1)
+            if len(image_data) > 20 * 1024 * 1024:
+                return api_error_response(
+                    validation_error("拼豆图纸文件超过 20MB", "请缩小母版后再试。"),
+                    context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id},
+                )
+
+            def form_int(name, default):
+                raw = request.form.get(name)
+                return default if raw in (None, '') else int(raw)
+
+            result = get_history_service().append_pattern_image(
+                record_id=record_id,
+                request_id=request_id,
+                image_data=image_data,
+                source_image_index=form_int('source_image_index', 0),
+                columns=form_int('columns', 104),
+                rows=form_int('rows', 104),
+                used_colors=form_int('used_colors', 40),
+            )
+            return jsonify({
+                "success": True,
+                "appended": result["appended"],
+                "page_index": result["page_index"],
+                "filename": result["filename"],
+                "record": result["record"],
+            }), 200
+        except (TypeError, ValueError) as exc:
+            return api_error_response(
+                validation_error(str(exc), "拼豆图纸参数或文件无效。"),
+                context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id},
+            )
+        except FileNotFoundError as exc:
+            return api_error_response(str(exc), status=404, context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id})
+        except Exception as exc:
+            return api_error_response(exc, context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id})
 
     @history_bp.route('/history/<record_id>', methods=['DELETE'])
     def delete_history(record_id):

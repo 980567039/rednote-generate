@@ -9,12 +9,15 @@ import os
 import json
 import uuid
 import logging
+import io
 import tempfile
 from threading import RLock
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 from enum import Enum
+
+from PIL import Image
 
 from backend.services.history_image_merger import HistoryImageMerger
 
@@ -564,6 +567,141 @@ class HistoryService:
             return False
         return self.update_record(record_id, status=status)
 
+    def append_pattern_image(
+        self,
+        record_id: str,
+        request_id: str,
+        image_data: bytes,
+        source_image_index: int,
+        columns: int,
+        rows: int,
+        used_colors: int,
+    ) -> Dict[str, Any]:
+        """幂等地把 Perler 母版追加为历史记录的最后一页。"""
+        with self._ensure_lock():
+            record = self.get_record(record_id)
+            if not record:
+                raise FileNotFoundError("历史记录不存在")
+
+            images = dict(record.get("images") or {})
+            pattern_requests = dict(images.get("pattern_requests") or {})
+            existing = pattern_requests.get(request_id)
+            if isinstance(existing, dict) and existing.get("filename"):
+                return {
+                    "record": record,
+                    "appended": False,
+                    "page_index": existing.get("page_index"),
+                    "filename": existing["filename"],
+                }
+
+            if not image_data or len(image_data) > 20 * 1024 * 1024:
+                raise ValueError("拼豆图纸文件为空或超过 20MB")
+            if not all(isinstance(value, int) and value >= 1 for value in (columns, rows)):
+                raise ValueError("拼豆图纸网格尺寸无效")
+            if columns > 300 or rows > 300:
+                raise ValueError("拼豆图纸网格尺寸不能超过 300×300")
+            if not isinstance(used_colors, int) or not 1 <= used_colors <= 64:
+                raise ValueError("拼豆图纸用色数量无效")
+            if not isinstance(source_image_index, int) or source_image_index < 0:
+                raise ValueError("来源图片索引无效")
+
+            try:
+                with Image.open(io.BytesIO(image_data)) as image:
+                    if image.format != "PNG":
+                        raise ValueError("只允许追加 PNG 拼豆母版")
+                    image.verify()
+                with Image.open(io.BytesIO(image_data)) as image:
+                    image.load()
+                    if image.width * image.height > 64_000_000:
+                        raise ValueError("拼豆图纸像素面积超过安全上限")
+            except ValueError:
+                raise
+            except Exception as exc:
+                raise ValueError("拼豆图纸不是有效的 PNG 文件") from exc
+
+            task_id = images.get("task_id")
+            if not isinstance(task_id, str) or not task_id or os.path.basename(task_id) != task_id:
+                raise ValueError("历史记录没有安全的图片任务目录")
+            task_dir = os.path.realpath(os.path.join(self.history_dir, task_id))
+            history_root = os.path.realpath(self.history_dir)
+            if os.path.commonpath([history_root, task_dir]) != history_root or not os.path.isdir(task_dir):
+                raise ValueError("历史记录图片目录不存在")
+
+            outline = dict(record.get("outline") or {})
+            pages = list(outline.get("pages") or [])
+            generated = list(images.get("generated") or [])
+            if len(generated) != len(pages):
+                raise ValueError("历史记录页面和图片数量不一致，请先同步历史记录")
+            source_page = pages[source_image_index] if source_image_index < len(pages) else None
+            if not isinstance(source_page, dict) or source_page.get("type") == "pattern":
+                raise ValueError("来源图片索引必须指向已有的原始图片页面")
+
+            page_index = len(pages)
+            filename = f"pattern_{uuid.uuid4().hex}.png"
+            temporary_path = None
+            try:
+                fd, temporary_path = tempfile.mkstemp(prefix=".pattern-", suffix=".png", dir=task_dir)
+                with os.fdopen(fd, "wb") as image_file:
+                    image_file.write(image_data)
+                    image_file.flush()
+                    os.fsync(image_file.fileno())
+                os.replace(temporary_path, os.path.join(task_dir, filename))
+                temporary_path = None
+            finally:
+                if temporary_path:
+                    try:
+                        os.unlink(temporary_path)
+                    except FileNotFoundError:
+                        pass
+
+            page = {
+                "index": page_index,
+                "type": "pattern",
+                "content": (
+                    f"拼豆图纸母版｜来源第 {source_image_index + 1} 张图片｜"
+                    f"{columns}×{rows} 格｜{used_colors} 色"
+                ),
+                "pattern": {
+                    "source_image_index": source_image_index,
+                    "columns": columns,
+                    "rows": rows,
+                    "used_colors": used_colors,
+                },
+            }
+            pages.append(page)
+            generated.append(filename)
+            outline["pages"] = pages
+            raw_outline = outline.get("raw")
+            page_text = f"[拼豆图纸]\n{page['content']}"
+            outline["raw"] = f"{raw_outline.rstrip()}\n\n<page>\n\n{page_text}" if isinstance(raw_outline, str) and raw_outline.strip() else page_text
+
+            images["generated"] = generated
+            images["pattern_requests"] = {
+                **pattern_requests,
+                request_id: {"filename": filename, "page_index": page_index},
+            }
+            record["outline"] = outline
+            record["images"] = images
+            record["updated_at"] = datetime.now().isoformat()
+            record["status"] = HistoryImageMerger.compute_status(generated, len(pages))
+            self._atomic_write_json(self._get_record_path(record_id), record)
+
+            index = self._load_index()
+            for index_record in index.get("records", []):
+                if index_record.get("id") == record_id:
+                    index_record["updated_at"] = record["updated_at"]
+                    index_record["status"] = record["status"]
+                    index_record["page_count"] = len(pages)
+                    index_record["thumbnail"] = record.get("thumbnail")
+                    break
+            self._save_index(index)
+            return {
+                "record": record,
+                "appended": True,
+                "page_index": page_index,
+                "filename": filename,
+            }
+
     def sync_record_images(self, record_id: str, record: Optional[Dict] = None) -> Dict[str, Any]:
         """从任务目录扫描图片并合并回历史记录。"""
         if record is None:
@@ -620,6 +758,8 @@ class HistoryService:
 
         current_generated = current.get("generated") or []
         incoming_generated = incoming.get("generated")
+        current_pattern_requests = dict(current.get("pattern_requests") or {})
+        incoming_pattern_requests = incoming.get("pattern_requests")
 
         # 显式绑定一个不同的新任务且传入空列表，表示开始一次全新生成。
         # 此时必须清空旧任务的图片；否则编辑页数或 force 重生成会继续显示
@@ -643,10 +783,20 @@ class HistoryService:
         if not incoming.get("task_id") and current.get("task_id"):
             incoming["task_id"] = current.get("task_id")
 
-        return {
+        if starts_new_task:
+            merged_pattern_requests = dict(incoming_pattern_requests or {}) if isinstance(incoming_pattern_requests, dict) else current_pattern_requests
+        else:
+            merged_pattern_requests = current_pattern_requests
+            if isinstance(incoming_pattern_requests, dict):
+                merged_pattern_requests.update(incoming_pattern_requests)
+
+        result = {
             "task_id": incoming.get("task_id"),
             "generated": [item or "" for item in incoming.get("generated", current_generated)],
         }
+        if merged_pattern_requests:
+            result["pattern_requests"] = merged_pattern_requests
+        return result
 
     def _protect_status(self, current_status: Optional[str], incoming_status: str, record: Dict) -> str:
         if (

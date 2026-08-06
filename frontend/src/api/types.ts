@@ -2,8 +2,14 @@ import type { AppError } from '../utils/errors'
 
 export interface Page {
   index: number
-  type: 'cover' | 'content' | 'summary'
+  type: 'cover' | 'content' | 'summary' | 'pattern'
   content: string
+  pattern?: {
+    source_image_index: number
+    columns: number
+    rows: number
+    used_colors: number
+  }
 }
 
 export interface OutlineResponse {
