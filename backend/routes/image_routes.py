@@ -14,9 +14,18 @@ import json
 import base64
 import logging
 from flask import Blueprint, request, jsonify, Response, send_file
-from backend.errors import ensure_app_error
+from backend.errors import AppError, ensure_app_error
 from backend.services.image import ActiveGenerationError, get_image_service
 from backend.services.history import get_history_service
+from backend.services.pattern_ai import (
+    PatternAIGenerationError,
+    PatternAIInputError,
+    PatternAIUnsupportedProviderError,
+    parse_pattern_ai_request,
+    refine_pattern_image,
+    validate_pattern_preview,
+    validate_source_image,
+)
 from backend.services.series import build_context, get_template, series_context_from_payload
 from .utils import (
     api_error_response,
@@ -91,6 +100,111 @@ def create_image_blueprint():
     image_bp = Blueprint('image', __name__)
 
     # ==================== 图片生成 ====================
+
+    @image_bp.route('/pattern/ai-refine', methods=['POST'])
+    def refine_pattern_with_ai():
+        """使用当前激活图片服务商执行拼豆素材的双阶段 AI 精修。"""
+        context = {"endpoint": "/api/pattern/ai-refine"}
+        try:
+            request_data = parse_pattern_ai_request(
+                request.form.get("stage"),
+                request.form.get("columns"),
+                request.form.get("rows"),
+                request.form.get("max_used_colors"),
+            )
+            context["stage"] = request_data.stage
+
+            source_upload = request.files.get("source")
+            if source_upload is None:
+                raise PatternAIInputError("缺少 source 图片")
+            source_bytes = _read_limited_upload(
+                source_upload, 25 * 1024 * 1024, "source"
+            )
+            source_png = validate_source_image(
+                source_bytes, source_upload.mimetype
+            )
+
+            pattern_preview_png = None
+            if request_data.stage == "pattern":
+                pattern_upload = request.files.get("pattern_preview")
+                if pattern_upload is None:
+                    raise PatternAIInputError(
+                        "stage=pattern 时必须提供 pattern_preview"
+                    )
+                pattern_bytes = _read_limited_upload(
+                    pattern_upload,
+                    10 * 1024 * 1024,
+                    "pattern_preview",
+                )
+                pattern_preview_png = validate_pattern_preview(
+                    pattern_bytes, pattern_upload.mimetype
+                )
+
+            output_png = refine_pattern_image(
+                get_image_service(),
+                request_data,
+                source_png,
+                pattern_preview_png,
+            )
+            return Response(
+                output_png,
+                status=200,
+                mimetype="image/png",
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Pattern-AI-Stage": request_data.stage,
+                },
+            )
+        except PatternAIInputError as exc:
+            return api_error_response(
+                validation_error(
+                    str(exc),
+                    "请检查规格、图片格式和文件大小后重试。",
+                ),
+                context=context,
+            )
+        except PatternAIUnsupportedProviderError:
+            return api_error_response(
+                AppError(
+                    code="PATTERN_AI_REFERENCE_UNSUPPORTED",
+                    title="当前服务商无法执行 AI 精修",
+                    detail="当前图片服务商不支持参考图AI精修",
+                    suggestion="请切换到 image_api 或 Google GenAI；前端可继续使用未精修结果。",
+                    status=400,
+                    retryable=False,
+                ),
+                context=context,
+            )
+        except PatternAIGenerationError:
+            return api_error_response(
+                AppError(
+                    code="PATTERN_AI_FAILED",
+                    title="拼豆图片 AI 精修失败",
+                    detail="图片服务商未能完成本次精修。",
+                    suggestion="请稍后重试；前端可继续使用未精修结果。",
+                    status=502,
+                    retryable=True,
+                ),
+                context=context,
+            )
+        except Exception as exc:
+            # 仅记录异常类型，避免配置或上游异常中的密钥进入日志和响应。
+            logger.error(
+                "拼豆 AI 精修接口异常: stage=%s, error_type=%s",
+                context.get("stage", "unknown"),
+                type(exc).__name__,
+            )
+            return api_error_response(
+                AppError(
+                    code="PATTERN_AI_FAILED",
+                    title="拼豆图片 AI 精修失败",
+                    detail="图片服务暂时不可用。",
+                    suggestion="请稍后重试；前端可继续使用未精修结果。",
+                    status=502,
+                    retryable=True,
+                ),
+                context=context,
+            )
 
     @image_bp.route('/generate', methods=['POST'])
     def generate_images():
@@ -541,6 +655,17 @@ def _parse_base64_images(images_base64: list) -> list:
         images.append(base64.b64decode(img_b64))
 
     return images
+
+
+def _read_limited_upload(upload, max_bytes: int, field_name: str) -> bytes:
+    """最多读取限制值加一字节，避免仅依赖不可信的 Content-Length。"""
+    data = upload.stream.read(max_bytes + 1)
+    if not data:
+        raise PatternAIInputError(f"{field_name} 图片不能为空")
+    if len(data) > max_bytes:
+        size_mb = max_bytes // (1024 * 1024)
+        raise PatternAIInputError(f"{field_name} 图片不能超过 {size_mb}MB")
+    return data
 
 
 def _normalize_sse_error(event_type: str, data: dict, context: dict) -> dict:

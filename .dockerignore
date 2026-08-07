@@ -29,11 +29,19 @@ frontend/dist
 # 输出目录（用户数据）
 output
 history
+series
+series_templates.json
+series_projects.json
 
-# 环境变量（敏感信息）
+# 环境变量与本机密钥（敏感信息）
 .env
 .env.local
 .env.*.local
+server.md
+text_providers.yaml
+image_providers.yaml
+publish_config.yaml
+publish_tasks.json
 
 # 日志
 *.log

@@ -5,6 +5,7 @@ const AUTO_CHANNEL = 'redink-perler-auto'
 const VERSION = 1
 const MAX_SOURCE_BYTES = 25 * 1024 * 1024
 const MAX_PATTERN_BYTES = 20 * 1024 * 1024
+const MAX_PREVIEW_BYTES = 10 * 1024 * 1024
 const CONNECTION_TIMEOUT_MS = 15 * 1000
 const HANDOFF_TIMEOUT_MS = 5 * 60 * 1000
 const ALLOWED_SOURCE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp'])
@@ -15,6 +16,7 @@ const AUTO_PROGRESS_STAGES = new Set<PerlerAutoProgressStage>([
   'map',
   'cleanup',
   'background',
+  'refine',
   'render',
 ])
 
@@ -27,6 +29,7 @@ export interface PerlerPatternMetadata {
 export interface PerlerPatternResult {
   requestId: string
   pattern: Blob
+  preview?: Blob
   metadata: PerlerPatternMetadata
 }
 
@@ -37,10 +40,17 @@ export type PerlerAutoProgressStage =
   | 'map'
   | 'cleanup'
   | 'background'
+  | 'refine'
   | 'render'
 
+export type PatternPipelineProgressStage =
+  | 'ai-source'
+  | 'base-pattern'
+  | 'ai-pattern'
+  | 'final-pattern'
+
 export interface PerlerProgressUpdate {
-  stage: 'connect' | PerlerAutoProgressStage
+  stage: 'connect' | PerlerAutoProgressStage | PatternPipelineProgressStage
   completed: number
   total: number
 }
@@ -58,6 +68,8 @@ interface PerlerMessage {
   requestId?: string
   pattern?: ArrayBuffer
   mimeType?: string
+  preview?: ArrayBuffer
+  previewMimeType?: string
   metadata?: PerlerPatternMetadata
   stage?: unknown
   completed?: unknown
@@ -130,14 +142,26 @@ function randomRequestId(): string {
 
 function validateBridgeInput(input: {
   recordId: string
-  imageUrl: string
+  imageUrl?: string
+  source?: Blob
   imageIndex: number
   settings?: PerlerPatternSettings
 }) {
   if (!input.recordId.trim()) throw new Error('缺少历史记录 ID，无法生成拼豆图纸。')
-  if (!input.imageUrl.trim()) throw new Error('缺少原图地址，无法生成拼豆图纸。')
+  if (!input.imageUrl?.trim() && !input.source) throw new Error('缺少原图，无法生成拼豆图纸。')
   if (!Number.isInteger(input.imageIndex) || input.imageIndex < 0) throw new Error('原图页码无效。')
   if (input.settings && !isValidPerlerSettings(input.settings)) throw new Error('拼豆图纸规格无效。')
+}
+
+async function sourceImageBytes(input: { imageUrl?: string; source?: Blob }, signal?: AbortSignal): Promise<{
+  bytes: ArrayBuffer
+  mimeType: string
+}> {
+  if (!input.source) return fetchSourceImage(input.imageUrl || '', signal)
+  const mimeType = input.source.type.split(';', 1)[0].toLowerCase() || 'image/png'
+  if (input.source.size < 1 || input.source.size > MAX_SOURCE_BYTES) throw new Error('原图为空或超过 25MB。')
+  if (!ALLOWED_SOURCE_TYPES.has(mimeType)) throw new Error('原图格式不受支持，仅支持 PNG、JPEG 和 WebP。')
+  return { bytes: await input.source.arrayBuffer(), mimeType }
 }
 
 async function fetchSourceImage(imageUrl: string, signal?: AbortSignal): Promise<{
@@ -154,7 +178,7 @@ async function fetchSourceImage(imageUrl: string, signal?: AbortSignal): Promise
   return { bytes, mimeType }
 }
 
-function patternResultFromMessage(message: PerlerMessage, requestId: string): PerlerPatternResult {
+function patternResultFromMessage(message: PerlerMessage, requestId: string, requirePreview = false): PerlerPatternResult {
   if (
     message.mimeType !== 'image/png'
     || !(message.pattern instanceof ArrayBuffer)
@@ -162,16 +186,25 @@ function patternResultFromMessage(message: PerlerMessage, requestId: string): Pe
     || message.pattern.byteLength > MAX_PATTERN_BYTES
   ) throw new Error('Perler 回传的图纸不是有效 PNG，或文件超过 20MB。')
   if (!validMetadata(message.metadata)) throw new Error('Perler 回传的图纸元数据无效。')
+  const preview = message.previewMimeType === 'image/png'
+    && message.preview instanceof ArrayBuffer
+    && message.preview.byteLength > 0
+    && message.preview.byteLength <= MAX_PREVIEW_BYTES
+    ? new Blob([message.preview], { type: 'image/png' })
+    : undefined
+  if (requirePreview && !preview) throw new Error('Perler 未回传有效的无网格效果预览。')
   return {
     requestId,
     pattern: new Blob([message.pattern], { type: 'image/png' }),
+    ...(preview ? { preview } : {}),
     metadata: message.metadata,
   }
 }
 
 export async function generatePatternWithPerler(input: {
   recordId: string
-  imageUrl: string
+  imageUrl?: string
+  source?: Blob
   imageIndex: number
   fileName?: string
   settings?: PerlerPatternSettings
@@ -253,7 +286,7 @@ export async function generatePatternWithPerler(input: {
     }
     window.addEventListener('message', onMessage)
     timeout = window.setTimeout(() => finishError(new Error('Perler 交接超时，请确认窗口仍然打开。')), HANDOFF_TIMEOUT_MS)
-    void fetchSourceImage(input.imageUrl)
+    void sourceImageBytes(input)
       .then(source => {
         sourceBytes = source.bytes
         mimeType = source.mimeType
@@ -265,7 +298,8 @@ export async function generatePatternWithPerler(input: {
 
 export function generatePatternAutomatically(input: {
   recordId: string
-  imageUrl: string
+  imageUrl?: string
+  source?: Blob
   imageIndex: number
   fileName?: string
   settings: PerlerPatternSettings
@@ -396,7 +430,7 @@ export function generatePatternAutomatically(input: {
       }
       if (message.type !== 'AUTO_PATTERN_READY') return
       try {
-        finishSuccess(patternResultFromMessage(message, requestId))
+        finishSuccess(patternResultFromMessage(message, requestId, true))
       } catch (reason) {
         finishError(reason)
       }
@@ -413,7 +447,7 @@ export function generatePatternAutomatically(input: {
       () => finishError(new Error('生成拼豆图纸超时，请重试或进入 Perler 手动生成。')),
       HANDOFF_TIMEOUT_MS,
     )
-    void fetchSourceImage(input.imageUrl, abortController.signal)
+    void sourceImageBytes(input, abortController.signal)
       .then(source => {
         sourceBytes = source.bytes
         sourceMimeType = source.mimeType

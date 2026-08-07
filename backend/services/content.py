@@ -107,7 +107,9 @@ class ContentService:
         """解析 AI 返回的 JSON 响应"""
         # 尝试直接解析
         try:
-            return json.loads(response_text)
+            # 部分兼容模型会在 JSON 字符串值中直接输出换行；strict=False
+            # 仍只接受 JSON 结构，但允许这类可修复的控制字符。
+            return json.loads(response_text, strict=False)
         except json.JSONDecodeError:
             pass
 
@@ -115,7 +117,7 @@ class ContentService:
         json_match = re.search(r'```(?:json)?\s*\n?([\s\S]*?)\n?```', response_text)
         if json_match:
             try:
-                return json.loads(json_match.group(1).strip())
+                return json.loads(json_match.group(1).strip(), strict=False)
             except json.JSONDecodeError:
                 pass
 
@@ -124,7 +126,7 @@ class ContentService:
         end_idx = response_text.rfind('}')
         if start_idx != -1 and end_idx != -1:
             try:
-                return json.loads(response_text[start_idx:end_idx + 1])
+                return json.loads(response_text[start_idx:end_idx + 1], strict=False)
             except json.JSONDecodeError:
                 pass
 

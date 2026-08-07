@@ -1,0 +1,43 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: redink:local
+    container_name: redink
+    command:
+      - uv
+      - run
+      - --no-sync
+      - gunicorn
+      - --bind=0.0.0.0:12398
+      - --workers=1
+      - --threads=4
+      - --timeout=600
+      - --access-logfile=-
+      - --error-logfile=-
+      - backend.app:create_app()
+    ports:
+      - "127.0.0.1:12398:12398"
+    volumes:
+      - ./history:/app/history
+      - ./output:/app/output
+      - ./series:/app/series
+      - ./text_providers.yaml:/app/text_providers.yaml
+      - ./image_providers.yaml:/app/image_providers.yaml
+      - ./series_templates.json:/app/series_templates.json
+      - ./series_projects.json:/app/series_projects.json
+      - ./publish_config.yaml:/app/publish_config.yaml
+      - ./publish_tasks.json:/app/publish_tasks.json
+    environment:
+      FLASK_DEBUG: "false"
+      FLASK_HOST: 0.0.0.0
+      FLASK_PORT: "12398"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 1536m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

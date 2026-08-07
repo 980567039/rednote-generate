@@ -51,9 +51,53 @@
 
       <div v-else class="pattern-body">
         <p v-if="errorMessage" class="pattern-error" role="alert">{{ errorMessage }}</p>
-        <div class="pattern-preview">
-          <img v-if="previewUrl" :src="previewUrl" alt="生成的拼豆图纸预览" />
+        <div class="pattern-preview-toolbar">
+          <div v-if="hasComparison" class="pattern-version-switch" role="group" aria-label="选择预览版本">
+            <button
+              type="button"
+              :class="{ active: activePreview === 'ai' }"
+              :aria-pressed="activePreview === 'ai'"
+              @click="activePreview = 'ai'"
+            >
+              AI 精修版
+            </button>
+            <button
+              type="button"
+              :class="{ active: activePreview === 'base' }"
+              :aria-pressed="activePreview === 'base'"
+              @click="activePreview = 'base'"
+            >
+              104 精细基础版
+            </button>
+          </div>
+          <div class="pattern-preview-tools">
+            <span class="pattern-ai-badge" :class="{ enhanced: aiEnhanced }">
+              {{ aiEnhanced ? 'AI 已精修' : '104 精细基础版' }}
+            </span>
+            <button class="btn btn-secondary pattern-fullscreen-trigger" type="button" :disabled="!activePreviewUrl" @click="openFullscreen">
+              全屏查看
+            </button>
+          </div>
         </div>
+        <button
+          v-if="activePreviewUrl"
+          class="pattern-preview"
+          type="button"
+          :aria-label="`全屏查看${activePreviewLabel}`"
+          @click="openFullscreen"
+        >
+          <img :src="activePreviewUrl" :alt="`${activePreviewLabel}拼豆图纸预览`" />
+          <span class="pattern-preview-hint">点击查看原始尺寸</span>
+        </button>
+        <div v-else class="pattern-preview pattern-preview-empty">
+          暂无可预览的图纸
+        </div>
+        <aside v-if="warnings.length" class="pattern-warnings" aria-label="生成提示">
+          <strong>生成提示</strong>
+          <ul>
+            <li v-for="(warning, index) in warnings" :key="`${index}-${warning}`">{{ warning }}</li>
+          </ul>
+        </aside>
         <dl v-if="metadata" class="pattern-metadata">
           <div><dt>实际规格</dt><dd>{{ metadata.columns }} × {{ metadata.rows }}</dd></div>
           <div><dt>实际用色</dt><dd>{{ metadata.usedColors }} 色</dd></div>
@@ -70,10 +114,67 @@
       </div>
     </section>
   </div>
+
+  <Teleport to="body">
+    <div v-if="fullscreenOpen" class="pattern-fullscreen" role="dialog" aria-modal="true" aria-label="拼豆图纸全屏预览">
+      <header class="pattern-fullscreen-toolbar">
+        <div class="pattern-fullscreen-title">
+          <strong>{{ activePreviewLabel }}</strong>
+          <span>{{ fullscreenFit ? '适应窗口' : `${zoomPercent}%` }}</span>
+        </div>
+        <div v-if="hasComparison" class="pattern-version-switch pattern-version-switch-dark" role="group" aria-label="选择全屏预览版本">
+          <button
+            type="button"
+            :class="{ active: activePreview === 'ai' }"
+            :aria-pressed="activePreview === 'ai'"
+            @click="activePreview = 'ai'"
+          >
+            AI 精修版
+          </button>
+          <button
+            type="button"
+            :class="{ active: activePreview === 'base' }"
+            :aria-pressed="activePreview === 'base'"
+            @click="activePreview = 'base'"
+          >
+            104 精细基础版
+          </button>
+        </div>
+        <div class="pattern-zoom-controls" aria-label="预览缩放控制">
+          <button type="button" aria-label="缩小" title="缩小" @click="zoomOut">−</button>
+          <input
+            :value="zoomPercent"
+            type="range"
+            min="25"
+            max="400"
+            step="25"
+            aria-label="缩放比例"
+            @input="onZoomInput"
+          />
+          <button type="button" aria-label="放大" title="放大" @click="zoomIn">+</button>
+          <button type="button" @click="setZoom(100)">100%</button>
+          <button type="button" :class="{ active: fullscreenFit }" @click="fitFullscreen">适应窗口</button>
+          <button class="pattern-fullscreen-close" type="button" aria-label="关闭全屏预览" title="关闭（Esc）" @click="closeFullscreen">×</button>
+        </div>
+      </header>
+      <div class="pattern-fullscreen-canvas">
+        <div class="pattern-fullscreen-stage" :class="{ fit: fullscreenFit }">
+          <img
+            v-if="activePreviewUrl"
+            :key="activePreviewUrl"
+            :src="activePreviewUrl"
+            :alt="`${activePreviewLabel}拼豆图纸全尺寸预览`"
+            :style="fullscreenImageStyle"
+            @load="captureFullscreenImageSize"
+          />
+        </div>
+      </div>
+    </div>
+  </Teleport>
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import {
   isValidPerlerSettings,
   loadPerlerSettings,
@@ -83,18 +184,32 @@ import {
 import type { PerlerPatternMetadata, PerlerProgressUpdate } from '../../integrations/perlerBridge'
 
 type PatternStep = 'config' | 'progress' | 'preview'
+type PatternProgressStage =
+  | PerlerProgressUpdate['stage']
+  | 'ai-source'
+  | 'base-pattern'
+  | 'ai-pattern'
+  | 'final-pattern'
+type PatternProgressUpdate = Omit<PerlerProgressUpdate, 'stage'> & { stage: PatternProgressStage }
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   visible: boolean
   step: PatternStep
   pageNumber: number
-  progress: PerlerProgressUpdate | null
+  progress: PatternProgressUpdate | null
   previewUrl: string
+  beforePreviewUrl?: string
+  aiEnhanced?: boolean
+  warnings?: string[]
   metadata: PerlerPatternMetadata | null
   errorMessage: string
   isRefining: boolean
   isAppending: boolean
-}>()
+}>(), {
+  beforePreviewUrl: '',
+  aiEnhanced: false,
+  warnings: () => [],
+})
 
 const emit = defineEmits<{
   close: []
@@ -107,9 +222,21 @@ const columns = ref('104')
 const rows = ref('104')
 const maxUsedColors = ref('40')
 const formError = ref('')
+const activePreview = ref<'ai' | 'base'>('ai')
+const fullscreenOpen = ref(false)
+const fullscreenFit = ref(true)
+const zoomPercent = ref(100)
+const fullscreenNaturalSize = ref({ width: 0, height: 0 })
 const busy = computed(() => props.isRefining || props.isAppending)
+const hasComparison = computed(() => Boolean(props.aiEnhanced && props.beforePreviewUrl && props.previewUrl))
+const activePreviewUrl = computed(() => (
+  activePreview.value === 'base' && hasComparison.value ? props.beforePreviewUrl : props.previewUrl
+))
+const activePreviewLabel = computed(() => (
+  activePreview.value === 'base' && hasComparison.value ? '104 精细基础版' : props.aiEnhanced ? 'AI 精修版' : '104 精细基础版'
+))
 
-const stageLabels: Record<PerlerProgressUpdate['stage'], string> = {
+const stageLabels: Record<PatternProgressStage, string> = {
   connect: '正在连接 Perler…',
   prepare: '正在准备原图…',
   sample: '正在采样像素…',
@@ -118,6 +245,11 @@ const stageLabels: Record<PerlerProgressUpdate['stage'], string> = {
   cleanup: '正在清理零碎色块…',
   background: '正在识别并移除背景…',
   render: '正在渲染母版图纸…',
+  refine: '正在等待 Perler 精修结果…',
+  'ai-source': '正在使用 AI 整理原素材…',
+  'base-pattern': '正在生成 104 精细基础版…',
+  'ai-pattern': '正在使用 AI 精修拼豆图纸…',
+  'final-pattern': '正在校验并渲染最终图纸…',
 }
 
 const progressLabel = computed(() => stageLabels[props.progress?.stage ?? 'connect'])
@@ -144,9 +276,90 @@ watch(
   () => [props.visible, props.step] as const,
   ([visible, step], previous) => {
     if (visible && step === 'config' && (!previous || !previous[0] || previous[1] !== 'config')) resetForm()
+    if (visible && step === 'preview' && (!previous || !previous[0] || previous[1] !== 'preview')) activePreview.value = 'ai'
+    if (!visible || step !== 'preview') closeFullscreen()
   },
   { immediate: true },
 )
+
+watch(hasComparison, (available) => {
+  if (!available) activePreview.value = 'ai'
+})
+
+watch(activePreviewUrl, () => {
+  fullscreenNaturalSize.value = { width: 0, height: 0 }
+})
+
+const fullscreenImageStyle = computed(() => {
+  if (fullscreenFit.value) {
+    return {
+      width: 'auto',
+      height: 'auto',
+      maxWidth: '100%',
+      maxHeight: '100%',
+      imageRendering: 'auto' as const,
+    }
+  }
+
+  const { width, height } = fullscreenNaturalSize.value
+  const scale = zoomPercent.value / 100
+  return {
+    width: width ? `${Math.round(width * scale)}px` : 'auto',
+    height: height ? `${Math.round(height * scale)}px` : 'auto',
+    maxWidth: 'none',
+    maxHeight: 'none',
+    imageRendering: zoomPercent.value >= 100 ? 'pixelated' as const : 'auto' as const,
+  }
+})
+
+function openFullscreen() {
+  if (!activePreviewUrl.value) return
+  fullscreenFit.value = true
+  fullscreenOpen.value = true
+}
+
+function closeFullscreen() {
+  fullscreenOpen.value = false
+}
+
+function setZoom(value: number) {
+  zoomPercent.value = Math.max(25, Math.min(400, Math.round(value / 25) * 25))
+  fullscreenFit.value = false
+}
+
+function zoomIn() {
+  setZoom(fullscreenFit.value ? 125 : zoomPercent.value + 25)
+}
+
+function zoomOut() {
+  setZoom(fullscreenFit.value ? 75 : zoomPercent.value - 25)
+}
+
+function fitFullscreen() {
+  fullscreenFit.value = true
+}
+
+function onZoomInput(event: Event) {
+  setZoom(Number((event.target as HTMLInputElement).value))
+}
+
+function captureFullscreenImageSize(event: Event) {
+  const image = event.target as HTMLImageElement
+  fullscreenNaturalSize.value = { width: image.naturalWidth, height: image.naturalHeight }
+}
+
+function onFullscreenKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') closeFullscreen()
+}
+
+watch(fullscreenOpen, (open) => {
+  if (open) window.addEventListener('keydown', onFullscreenKeydown)
+  else window.removeEventListener('keydown', onFullscreenKeydown)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onFullscreenKeydown)
+})
 
 function start() {
   const settings = {
@@ -165,13 +378,14 @@ function start() {
 
 function close() {
   if (busy.value) return
+  closeFullscreen()
   emit('close')
 }
 </script>
 
 <style scoped>
 .pattern-backdrop { position: fixed; inset: 0; z-index: 110; display: grid; place-items: center; padding: 20px; background: rgba(15, 23, 42, 0.52); backdrop-filter: blur(3px); }
-.pattern-dialog { width: min(620px, 100%); max-height: calc(100vh - 40px); overflow: auto; border: 1px solid var(--border-color); border-radius: 16px; background: var(--bg-card); box-shadow: 0 20px 70px rgba(15, 23, 42, 0.28); }
+.pattern-dialog { width: min(1080px, 100%); max-height: calc(100vh - 40px); overflow: auto; border: 1px solid var(--border-color); border-radius: 16px; background: var(--bg-card); box-shadow: 0 20px 70px rgba(15, 23, 42, 0.28); }
 .pattern-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding: 22px 24px 18px; border-bottom: 1px solid var(--border-color); }
 .pattern-header h2 { margin: 0; color: var(--text-main); font-size: 19px; }
 .pattern-header p { margin: 6px 0 0; color: var(--text-sub); font-size: 13px; line-height: 1.5; }
@@ -194,17 +408,60 @@ function close() {
 .pattern-progress-track { width: min(380px, 100%); height: 8px; margin-top: 22px; overflow: hidden; border-radius: 999px; background: var(--bg-subtle); }
 .pattern-progress-track span { display: block; height: 100%; border-radius: inherit; background: var(--primary); transition: width 0.25s ease; }
 .pattern-progress .pattern-actions { width: 100%; }
-.pattern-preview { display: grid; min-height: 260px; max-height: 54vh; place-items: center; overflow: auto; border: 1px solid var(--border-color); border-radius: 10px; background: var(--bg-subtle); }
-.pattern-preview img { display: block; max-width: 100%; max-height: 52vh; object-fit: contain; image-rendering: auto; }
+.pattern-preview-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.pattern-version-switch { display: inline-flex; gap: 3px; padding: 3px; border-radius: 9px; background: var(--bg-subtle); }
+.pattern-version-switch button { padding: 7px 11px; border: 0; border-radius: 7px; background: transparent; color: var(--text-sub); cursor: pointer; font: inherit; font-size: 12px; font-weight: 600; }
+.pattern-version-switch button.active { background: var(--bg-card); color: var(--primary); box-shadow: 0 1px 4px rgba(15, 23, 42, 0.12); }
+.pattern-preview-tools { display: flex; align-items: center; gap: 9px; margin-left: auto; }
+.pattern-ai-badge { display: inline-flex; align-items: center; min-height: 26px; padding: 0 9px; border: 1px solid var(--border-color); border-radius: 999px; color: var(--text-sub); font-size: 11px; font-weight: 600; }
+.pattern-ai-badge.enhanced { border-color: color-mix(in srgb, var(--primary) 35%, var(--border-color)); background: color-mix(in srgb, var(--primary) 9%, var(--bg-card)); color: var(--primary); }
+.pattern-fullscreen-trigger { padding: 7px 11px; font-size: 12px; }
+.pattern-preview { position: relative; display: grid; width: 100%; min-height: 320px; max-height: 58vh; padding: 0; place-items: center; overflow: auto; border: 1px solid var(--border-color); border-radius: 10px; outline: none; background: var(--bg-subtle); cursor: zoom-in; }
+.pattern-preview:hover, .pattern-preview:focus-visible { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-fade); }
+.pattern-preview img { display: block; max-width: 100%; max-height: 56vh; object-fit: contain; image-rendering: auto; }
+.pattern-preview-hint { position: absolute; right: 12px; bottom: 12px; padding: 6px 9px; border-radius: 999px; background: rgba(15, 23, 42, 0.76); color: #fff; font-size: 11px; pointer-events: none; }
+.pattern-preview-empty { color: var(--text-sub); cursor: default; font-size: 13px; }
+.pattern-preview-empty:hover { border-color: var(--border-color); box-shadow: none; }
+.pattern-warnings { margin-top: 14px; padding: 12px 14px; border: 1px solid color-mix(in srgb, #f59e0b 32%, var(--border-color)); border-radius: 9px; background: color-mix(in srgb, #f59e0b 8%, var(--bg-card)); color: var(--text-main); font-size: 12px; line-height: 1.5; }
+.pattern-warnings strong { color: #b45309; }
+.pattern-warnings ul { margin: 6px 0 0; padding-left: 18px; }
+.pattern-warnings li + li { margin-top: 3px; }
 .pattern-metadata { display: flex; flex-wrap: wrap; gap: 22px; margin: 16px 0 0; }
 .pattern-metadata div { display: flex; align-items: baseline; gap: 7px; }
 .pattern-metadata dt { color: var(--text-sub); font-size: 12px; }
 .pattern-metadata dd { margin: 0; color: var(--text-main); font-size: 13px; font-weight: 600; }
+.pattern-fullscreen { position: fixed; inset: 0; z-index: 300; display: grid; grid-template-rows: auto minmax(0, 1fr); background: #111827; }
+.pattern-fullscreen-toolbar { display: flex; align-items: center; gap: 14px; min-height: 60px; padding: 9px 16px; border-bottom: 1px solid rgba(255, 255, 255, 0.14); background: rgba(17, 24, 39, 0.98); color: #fff; }
+.pattern-fullscreen-title { display: flex; flex-direction: column; min-width: 125px; gap: 2px; }
+.pattern-fullscreen-title strong { font-size: 13px; }
+.pattern-fullscreen-title span { color: #9ca3af; font-size: 11px; }
+.pattern-version-switch-dark { flex: 0 1 auto; background: rgba(255, 255, 255, 0.1); }
+.pattern-version-switch-dark button { color: #cbd5e1; }
+.pattern-version-switch-dark button.active { background: rgba(255, 255, 255, 0.17); color: #fff; box-shadow: none; }
+.pattern-zoom-controls { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.pattern-zoom-controls button { min-height: 34px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 7px; background: rgba(255, 255, 255, 0.08); color: #fff; cursor: pointer; font: inherit; font-size: 12px; }
+.pattern-zoom-controls button:hover, .pattern-zoom-controls button.active { background: rgba(255, 255, 255, 0.2); }
+.pattern-zoom-controls input { width: 132px; accent-color: var(--primary); }
+.pattern-zoom-controls .pattern-fullscreen-close { width: 36px; padding: 0; font-size: 23px; line-height: 1; }
+.pattern-fullscreen-canvas { min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.pattern-fullscreen-stage { display: grid; width: max-content; min-width: 100%; min-height: 100%; padding: 32px; box-sizing: border-box; place-items: center; }
+.pattern-fullscreen-stage.fit { width: 100%; height: 100%; }
+.pattern-fullscreen-stage img { display: block; flex: none; object-fit: contain; }
 @keyframes pattern-spin { to { transform: rotate(360deg); } }
-@media (max-width: 620px) {
+@media (max-width: 760px) {
   .pattern-backdrop { padding: 10px; }
   .pattern-header, .pattern-body { padding: 18px; }
   .pattern-fields { grid-template-columns: 1fr; }
+  .pattern-preview-toolbar { align-items: stretch; flex-direction: column; }
+  .pattern-version-switch { display: grid; grid-template-columns: 1fr 1fr; }
+  .pattern-preview-tools { justify-content: space-between; width: 100%; margin-left: 0; }
+  .pattern-preview { min-height: 220px; }
   .pattern-preview-actions .btn { width: 100%; }
+  .pattern-fullscreen-toolbar { align-items: stretch; flex-wrap: wrap; padding: 9px 10px; }
+  .pattern-fullscreen-title { min-width: 0; }
+  .pattern-version-switch-dark { order: 3; width: 100%; }
+  .pattern-zoom-controls { flex-wrap: wrap; margin-left: auto; }
+  .pattern-zoom-controls input { width: 90px; }
+  .pattern-fullscreen-stage { padding: 14px; }
 }
 </style>

@@ -270,7 +270,7 @@ class HistoryService:
                 "outline": outline,  # 保存完整的大纲数据
                 "images": {
                     "task_id": task_id,
-                    "generated": []  # 初始无生成图片
+                    "generated": [],  # 初始无生成图片
                 },
                 "content": self._empty_content(),
                 "status": RecordStatus.DRAFT,  # 初始状态：草稿
@@ -522,12 +522,15 @@ class HistoryService:
             status = HistoryImageMerger.compute_status(generated, total_count)
             thumbnail = HistoryImageMerger.first_image(generated)
 
+            image_payload = {
+                "task_id": task_id,
+                "generated": generated,
+                # 显式清除当前页的旧错误；空 errors 字典仍会被安全合并并省略保存。
+                "errors": {str(page_index): None},
+            }
             return self.update_record(
                 record_id,
-                images={
-                    "task_id": task_id,
-                    "generated": generated,
-                },
+                images=image_payload,
                 status=status,
                 thumbnail=thumbnail,
             )
@@ -546,6 +549,7 @@ class HistoryService:
             images={
                 "task_id": task_id,
                 "generated": [] if is_new_task else images.get("generated") or [],
+                "errors": {} if is_new_task else images.get("errors") or {},
             },
             status=RecordStatus.GENERATING,
         )
@@ -758,6 +762,8 @@ class HistoryService:
 
         current_generated = current.get("generated") or []
         incoming_generated = incoming.get("generated")
+        current_errors = dict(current.get("errors") or {})
+        incoming_errors = incoming.get("errors")
         current_pattern_requests = dict(current.get("pattern_requests") or {})
         incoming_pattern_requests = incoming.get("pattern_requests")
 
@@ -784,8 +790,17 @@ class HistoryService:
             incoming["task_id"] = current.get("task_id")
 
         if starts_new_task:
+            merged_errors = dict(incoming_errors or {}) if isinstance(incoming_errors, dict) else {}
             merged_pattern_requests = dict(incoming_pattern_requests or {}) if isinstance(incoming_pattern_requests, dict) else current_pattern_requests
         else:
+            merged_errors = current_errors
+            if isinstance(incoming_errors, dict):
+                for key, value in incoming_errors.items():
+                    key = str(key)
+                    if value in (None, ""):
+                        merged_errors.pop(key, None)
+                    else:
+                        merged_errors[key] = value
             merged_pattern_requests = current_pattern_requests
             if isinstance(incoming_pattern_requests, dict):
                 merged_pattern_requests.update(incoming_pattern_requests)
@@ -794,6 +809,8 @@ class HistoryService:
             "task_id": incoming.get("task_id"),
             "generated": [item or "" for item in incoming.get("generated", current_generated)],
         }
+        if merged_errors:
+            result["errors"] = merged_errors
         if merged_pattern_requests:
             result["pattern_requests"] = merged_pattern_requests
         return result

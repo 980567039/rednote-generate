@@ -59,6 +59,7 @@ class ImageApiGenerator(ImageGeneratorBase):
         model: str = None,
         reference_image: Optional[bytes] = None,
         reference_images: Optional[List[bytes]] = None,
+        direct_reference_prompt: bool = False,
         **kwargs
     ) -> bytes:
         """
@@ -89,7 +90,14 @@ class ImageApiGenerator(ImageGeneratorBase):
         if 'chat' in self.endpoint_type or 'completions' in self.endpoint_type:
             return self._generate_via_chat_api(prompt, aspect_ratio, model, reference_image, reference_images)
         else:
-            return self._generate_via_images_api(prompt, aspect_ratio, model, reference_image, reference_images)
+            return self._generate_via_images_api(
+                prompt,
+                aspect_ratio,
+                model,
+                reference_image,
+                reference_images,
+                direct_reference_prompt,
+            )
 
     def _generate_via_images_api(
         self,
@@ -97,7 +105,8 @@ class ImageApiGenerator(ImageGeneratorBase):
         aspect_ratio: str,
         model: str,
         reference_image: Optional[bytes] = None,
-        reference_images: Optional[List[bytes]] = None
+        reference_images: Optional[List[bytes]] = None,
+        direct_reference_prompt: bool = False,
     ) -> bytes:
         """通过 /v1/images/generations 端点生成图片"""
         headers = {
@@ -132,8 +141,9 @@ class ImageApiGenerator(ImageGeneratorBase):
 
             payload["image"] = image_uris
 
-            ref_count = len(all_reference_images)
-            enhanced_prompt = f"""参考提供的 {ref_count} 张图片的风格（色彩、光影、构图、氛围），生成一张新图片。
+            if not direct_reference_prompt:
+                ref_count = len(all_reference_images)
+                enhanced_prompt = f"""参考提供的 {ref_count} 张图片的风格（色彩、光影、构图、氛围），生成一张新图片。
 
 新图片内容：{prompt}
 
@@ -142,7 +152,7 @@ class ImageApiGenerator(ImageGeneratorBase):
 2. 使用相似的光影处理
 3. 保持一致的画面质感
 4. 如果参考图中有人物或产品，可以适当融入"""
-            payload["prompt"] = enhanced_prompt
+                payload["prompt"] = enhanced_prompt
 
         return self.client.generate_via_images(payload)
 

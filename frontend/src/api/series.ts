@@ -271,6 +271,19 @@ export async function generateSeriesProjectItem(projectId: string, itemId: strin
   }
 }
 
+export async function retrySeriesProjectItemImages(projectId: string, itemId: string): Promise<SeriesApiResponse> {
+  try {
+    const response = await axios.post(
+      `${API_BASE_URL}/series/projects/${encodeURIComponent(projectId)}/items/${encodeURIComponent(itemId)}/retry-failed`,
+      {},
+      { timeout: 20000 }
+    )
+    return normalizeSeriesResponse(response.data)
+  } catch (error) {
+    return { success: false, ...getApiErrorPayload(error, '补全失败图片失败') }
+  }
+}
+
 export async function getSeriesProjectTasks(projectId: string): Promise<SeriesApiResponse> {
   try {
     const response = await axios.get(

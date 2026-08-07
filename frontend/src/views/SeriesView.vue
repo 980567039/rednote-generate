@@ -260,6 +260,33 @@
             <small v-if="!canChangeMode(item)">开始生成后不能切换内容方向</small>
           </div>
 
+          <!-- 图片失败信息不受收起状态影响，避免失败后用户不知道下一步怎么做。 -->
+          <section v-if="itemFailedImageCount(item) > 0" class="item-failure-panel" aria-live="polite">
+            <div class="item-failure-heading">
+              <div>
+                <strong>有 {{ itemFailedImageCount(item) }} 张图片生成失败</strong>
+                <p>成功图片会保留，补全操作只会重试缺失页面。</p>
+              </div>
+              <button
+                class="btn btn-primary small-btn"
+                type="button"
+                :disabled="itemBusy(item.id) || hasActiveProjectTask || !item.record_id"
+                @click="retryItemFailedImages(item)"
+              >
+                {{ itemBusy(item.id) ? '补全中…' : '一键补全失败图片' }}
+              </button>
+            </div>
+            <ul v-if="itemFailureEntries(item).length" class="item-failure-list">
+              <li v-for="entry in itemFailureEntries(item)" :key="`${item.id}-${entry.index}`">
+                <span>第 {{ entry.index + 1 }} 页</span>
+                <span class="item-failure-reason">{{ entry.reason }}</span>
+              </li>
+            </ul>
+            <p v-else class="item-failure-reason item-failure-fallback">
+              原始失败原因未保存，点击补全后会显示新的实时错误。
+            </p>
+          </section>
+
           <div v-if="!isItemCollapsed(item.id) && ['outline_ready', 'confirmed'].includes(item.status)" class="item-next-step">
             <ol class="item-step-track" aria-label="当前子主题制作步骤">
               <li class="done"><span>✓</span>大纲已生成</li>
@@ -325,7 +352,7 @@
               </button>
             </div>
           </footer>
-          <p v-if="!isItemCollapsed(item.id) && (item.error || item.error_message)" class="item-error">{{ itemErrorText(item) }}</p>
+          <p v-if="item.error || item.error_message" class="item-error">{{ itemErrorText(item) }}</p>
         </article>
       </div>
 
@@ -360,6 +387,7 @@ import {
   getSeriesProject,
   getSeriesProjectItems,
   getSeriesTopicSuggestions,
+  retrySeriesProjectItemImages,
   updateSeriesProjectItem,
   updateSeriesTemplate,
   type Page,
@@ -764,9 +792,17 @@ async function openResult(item: SeriesProjectItem) {
     const record = result.record
     const taskId = record.images.task_id
     const generated = record.images.generated || []
+    const imageErrors = record.images.errors || {}
     const images: GeneratedImage[] = record.outline.pages.map((page, index) => {
       const filename = generated[page.index] || generated[index] || ''
-      return { index: page.index, url: filename && taskId ? getImageUrl(taskId, filename) : '', status: filename ? 'done' : 'error', retryable: !filename }
+      const pageError = imageErrors[String(page.index)] ?? imageErrors[String(index)]
+      return {
+        index: page.index,
+        url: filename && taskId ? getImageUrl(taskId, filename) : '',
+        status: filename ? 'done' : 'error',
+        error: filename ? undefined : failureReason(pageError, '该页图片生成失败，可点击补全'),
+        retryable: !filename
+      }
     })
     const doneCount = images.filter(image => image.status === 'done').length
     store.replaceWork({
@@ -782,7 +818,7 @@ async function openResult(item: SeriesProjectItem) {
       progress: { current: doneCount, total: images.length, status: doneCount === images.length ? 'done' : 'error' },
       stage: doneCount === images.length ? 'result' : 'generating', content: record.content
     })
-    await router.push(doneCount === images.length ? '/result' : '/outline')
+    await router.push(doneCount > 0 ? '/result' : '/outline')
   } finally { openingRecordId.value = null }
 }
 
@@ -799,7 +835,58 @@ function itemPageCount(item: SeriesProjectItem) {
 function statusTone(status: string) { return ['completed', 'done'].includes(status) ? 'success' : ['failed', 'error'].includes(status) ? 'error' : ['queued', 'outlining', 'generating', 'running', 'processing'].includes(status) ? 'active' : '' }
 function pageTypeLabel(type: Page['type']) { return type === 'cover' ? '封面' : type === 'summary' ? '总结' : '内容' }
 function itemProgressText(item: SeriesProjectItem) { const value = item.progress; if (typeof value === 'number') return `${Math.round(value)}%`; return value?.total ? `${value.current}/${value.total}` : '' }
-function itemErrorText(item: SeriesProjectItem) { const value = normalizeApiError(item.error || item.error_message || '生成失败', '生成失败'); return value.suggestion || value.detail }
+function itemErrorText(item: SeriesProjectItem) {
+  return failureReason(item.error || item.error_message, '生成失败')
+}
+function failureReason(value: unknown, fallback: string) {
+  if (!value) return fallback
+  const normalized = normalizeApiError(value, '图片生成失败')
+  const detail = normalized.detail || normalized.suggestion || fallback
+  return normalized.suggestion && normalized.suggestion !== detail
+    ? `${normalized.title}：${detail}（${normalized.suggestion}）`
+    : `${normalized.title}：${detail}`
+}
+function itemFailureIndices(item: SeriesProjectItem): number[] {
+  const explicit = (item.failed_indices || [])
+    .map(value => Number(value))
+    .filter(value => Number.isInteger(value) && value >= 0)
+  const fromErrors = Object.keys(item.image_errors || {})
+    .map(value => Number(value))
+    .filter(value => Number.isInteger(value) && value >= 0)
+  const indices = Array.from(new Set([...explicit, ...fromErrors])).sort((a, b) => a - b)
+  if (indices.length) return indices
+
+  // 兼容旧数据：旧版本只保存进度，没有逐页错误。此时至少显示缺失数量，
+  // 不能凭空猜测具体页码和错误原因。
+  const progress = typeof item.progress === 'object' ? item.progress : null
+  const missing = progress ? Math.max(0, Number(progress.total || 0) - Number(progress.current || 0)) : 0
+  const imageWasAttempted = ['failed', 'partial', 'generating', 'completed'].includes(item.image_status || '')
+    || Number(progress?.current || 0) > 0
+  return missing > 0 && item.status === 'failed' && imageWasAttempted
+    ? Array.from({ length: missing }, (_, index) => index)
+    : []
+}
+function itemFailedImageCount(item: SeriesProjectItem) { return itemFailureIndices(item).length }
+function itemFailureEntries(item: SeriesProjectItem) {
+  const errors = item.image_errors || {}
+  return itemFailureIndices(item).map(index => ({
+    index,
+    reason: failureReason(errors[String(index)], '原始失败原因未保存，点击补全后会显示新的实时错误。')
+  }))
+}
+async function retryItemFailedImages(item: SeriesProjectItem) {
+  if (!item.record_id || itemBusy(item.id) || hasActiveProjectTask.value || itemFailedImageCount(item) === 0) return
+  setItemBusy(item.id, true)
+  error.value = null
+  try {
+    const result = await retrySeriesProjectItemImages(projectId.value, item.id)
+    if (!result.success) {
+      error.value = normalizeApiError(result.error || result.error_message || '补全失败图片失败', '补全失败图片失败')
+      return
+    }
+    await refreshAll()
+  } finally { setItemBusy(item.id, false) }
+}
 
 function schedulePolling() {
   stopPolling()
@@ -914,6 +1001,16 @@ watch(allowIpSuggestions, () => {
 .item-mode-row label { display: flex; align-items: center; gap: 8px; color: var(--text-sub); font-size: 10px; }
 .item-mode-row .control { min-width: 210px; padding: 6px 8px; font-size: 11px; }
 .item-mode-row small { color: var(--text-secondary); font-size: 10px; }
+.item-failure-panel { display: grid; gap: 9px; margin-top: 12px; padding: 11px 12px; border: 1px solid color-mix(in srgb, var(--primary-active) 42%, var(--border-color)); border-radius: 10px; background: color-mix(in srgb, var(--primary-active) 7%, var(--bg-card)); }
+.item-failure-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.item-failure-heading > div { min-width: 0; }
+.item-failure-heading strong { color: var(--primary-active); font-size: 12px; }
+.item-failure-heading p { margin: 2px 0 0; color: var(--text-sub); font-size: 10px; }
+.item-failure-list { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.item-failure-list li { display: flex; align-items: flex-start; gap: 8px; color: var(--text-sub); font-size: 10px; line-height: 1.45; }
+.item-failure-list li > span:first-child { flex: 0 0 auto; color: var(--primary-active); font-weight: 600; }
+.item-failure-reason { min-width: 0; color: var(--text-sub); overflow-wrap: anywhere; }
+.item-failure-fallback { margin: 0; }
 .item-select input { width: 16px; height: 16px; accent-color: var(--primary); }
 .item-index { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 32px; height: 32px; border-radius: 9px; background: var(--primary-fade); color: var(--primary); font-weight: 700; }
 .item-title { min-width: 0; flex: 1; }
@@ -972,6 +1069,8 @@ watch(allowIpSuggestions, () => {
   .item-mode-row { align-items: stretch; flex-direction: column; }
   .item-mode-row label { align-items: stretch; flex-direction: column; }
   .item-mode-row .control { width: 100%; }
+  .item-failure-heading { align-items: stretch; flex-direction: column; }
+  .item-failure-heading .btn { width: 100%; }
   .item-title { flex-basis: calc(100% - 80px); }
   .content-mode-badge, .status-badge { margin-left: 58px; }
   .item-collapse-toggle { margin-left: 58px; }

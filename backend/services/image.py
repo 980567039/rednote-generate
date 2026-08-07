@@ -700,6 +700,7 @@ class ImageService:
                         "index": index,
                         "status": "error",
                         "message": error,
+                        "error": app_error.to_dict(),
                         "retryable": app_error.retryable,
                         "phase": "cover",
                     },
@@ -810,6 +811,7 @@ class ImageService:
                 "completed": completed,
                 "failed": len(failed_indices),
                 "failed_indices": failed_indices,
+                "failed_errors": dict(state.get("failed") or {}),
             },
         }
 
@@ -848,6 +850,7 @@ class ImageService:
                 "index": index,
                 "status": "error",
                 "message": error,
+                "error": app_error.to_dict(),
                 "retryable": app_error.retryable,
                 "phase": "content",
             },
@@ -1022,7 +1025,10 @@ class ImageService:
         task_id: str,
         pages: List[Dict],
         record_id: Optional[str] = None,
-        series_context: str = ""
+        series_context: str = "",
+        full_outline: str = "",
+        user_topic: str = "",
+        user_images: Optional[List[bytes]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """
         批量重试失败的图片
@@ -1045,8 +1051,8 @@ class ImageService:
         if task_id in self._task_states:
             task_state = self._task_states[task_id]
             reference_image = task_state.get("cover_image")
-            user_images = task_state.get("user_images")
-            user_topic = task_state.get("user_topic", "")
+            user_images = task_state.get("user_images") or user_images
+            user_topic = task_state.get("user_topic") or user_topic
             if not series_context:
                 series_context = task_state.get("series_context", "")
 
@@ -1069,9 +1075,9 @@ class ImageService:
         }
 
         # 从任务状态中获取完整大纲
-        full_outline = ""
+        full_outline = full_outline or ""
         if task_id in self._task_states:
-            full_outline = self._task_states[task_id].get("full_outline", "")
+            full_outline = self._task_states[task_id].get("full_outline") or full_outline
         total_count = None
         if task_id in self._task_states:
             total_count = len(self._task_states[task_id].get("pages", []))
@@ -1099,12 +1105,19 @@ class ImageService:
                 }
 
             failed_count += 1
+            if record_id:
+                self.history_service.update_record(
+                    record_id,
+                    images={"errors": {str(index): error or "该页图片生成失败"}},
+                )
+            app_error = ensure_app_error(error, context={"task_id": task_id, "phase": "retry"})
             return {
                 "event": "error",
                 "data": {
                     "index": index,
                     "status": "error",
                     "message": error,
+                    "error": app_error.to_dict(),
                     "retryable": True
                 }
             }
@@ -1177,6 +1190,16 @@ class ImageService:
     def _settle_retry_task(self, task_id: str, record_id: Optional[str]):
         """重试结束后恢复可靠终态，避免任务永久停留在 running。"""
         if task_id not in self._task_states:
+            # 服务重启后内存任务状态不存在，但历史记录仍可根据已落盘图片收敛。
+            if record_id:
+                record = self.history_service.get_record(record_id, sync_images=True)
+                if record:
+                    images = record.get("images") or {}
+                    total = len(record.get("outline", {}).get("pages", []))
+                    generated = images.get("generated") or []
+                    status = HistoryImageMerger.compute_status(generated, total)
+                    history_status = "completed" if status == "completed" else ("partial" if status == "partial" else "error")
+                    self.history_service.finish_generation(record_id, task_id, history_status)
             return
         state = self._task_states[task_id]
         completed = len(state.get("generated") or {})

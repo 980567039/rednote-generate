@@ -142,6 +142,29 @@ def _confirm_item(project: Dict[str, Any], item: Dict[str, Any]) -> Optional[str
     return None
 
 
+def _fallback_character_content(item: Dict[str, Any]) -> Dict[str, Any]:
+    """角色图模式的文案兜底，避免文本模型格式异常阻塞图片生成。"""
+    topic = str(item.get("topic") or "像素角色")
+    names = [str(name).strip() for name in (item.get("character_names") or []) if str(name).strip()]
+    subject = "、".join(names) or topic
+    count = len(names) or len(item.get("pages") or []) or 1
+    return {
+        "success": True,
+        "titles": [
+            f"{topic}｜{count}张8-bit像素角色图",
+            f"像素角色设定图：{subject}",
+            f"{subject}的精细像素素材合集",
+        ],
+        "copywriting": (
+            f"本组为{topic}的精细像素角色设定图，共{count}张。"
+            f"每页独立展示一名角色：{subject}。"
+            "画面统一采用系列固定像素风与色板，重点保留角色的外观、服饰、表情、姿态和标志性道具，"
+            "不讲连续剧情，方便逐张查看、保存和制作。"
+        ),
+        "tags": ["像素画", "8bit", "角色设定图", "像素风素材", "创作参考"],
+    }
+
+
 def _update_project_progress(project: Dict[str, Any]) -> None:
     items = project.get("items", [])
     done = sum(1 for item in items if item.get("status") == "completed")
@@ -186,7 +209,15 @@ def _generate_item(project: Dict[str, Any], item: Dict[str, Any], history, conte
         return False
     snapshot = item["template_snapshot"]
     context = _context(project, item)
-    item.update({"status": "generating", "content_status": "generating", "image_status": "pending", "error": None})
+    item.update({
+        "status": "generating",
+        "content_status": "generating",
+        "image_status": "pending",
+        "error": None,
+        "image_errors": {},
+        "failed_indices": [],
+        "progress": {"current": 0, "total": len(item.get("pages", [])), "percent": 0},
+    })
     series_service.save_project(project)
     try:
         record_id = item.get("record_id")
@@ -211,7 +242,16 @@ def _generate_item(project: Dict[str, Any], item: Dict[str, Any], history, conte
 
         content = content_service.generate_content(item["topic"], item.get("outline", ""), **context)
         if not content.get("success"):
-            raise RuntimeError(content.get("error") or "成品文案生成失败")
+            if series_service.normalize_content_mode(item.get("content_mode", "story")) == "character_sheet":
+                # 图片和文案是两个独立产物；角色图文案接口格式异常时，
+                # 使用确定性兜底文案继续生成图片，避免整篇作品被错误标记为“图片失败”。
+                logger.warning(
+                    "角色图文案生成失败，使用兜底文案继续生图: project=%s item=%s error=%s",
+                    project.get("id"), item.get("id"), content.get("error"),
+                )
+                content = _fallback_character_content(item)
+            else:
+                raise RuntimeError(content.get("error") or "成品文案生成失败")
         content_errors = series_service.validate_content(content, snapshot)
         if content_errors:
             raise ValueError("；".join(content_errors))
@@ -246,16 +286,36 @@ def _generate_item(project: Dict[str, Any], item: Dict[str, Any], history, conte
                 total = len(item.get("pages", []))
                 item["progress"] = {"current": current, "total": total, "percent": round(current * 100 / max(1, total), 1)}
                 series_service.save_project(project)
+            if event.get("event") == "error":
+                data = event.get("data") or {}
+                index = data.get("index")
+                if isinstance(index, int):
+                    failure = data.get("error") or data.get("message") or "该页图片生成失败"
+                    item.setdefault("image_errors", {})[str(index)] = failure
+                    item.setdefault("failed_indices", []).append(index)
+                    item["failed_indices"] = sorted(set(item["failed_indices"]))
+                    # 历史记录同步保存逐页错误，刷新或服务重启后仍能看到原因。
+                    history.update_record(record_id, images={"errors": {str(index): failure}})
+                    series_service.save_project(project)
             if event.get("event") == "finish":
                 final = event.get("data") or {}
         if not final or not final.get("success"):
             status = (final or {}).get("status", "failed")
             item["image_status"] = "partial" if status == "partial" else "failed"
+            final_errors = (final or {}).get("failed_errors") or {}
+            for index, failure in final_errors.items():
+                item.setdefault("image_errors", {}).setdefault(str(index), failure)
+            item["failed_indices"] = sorted({
+                *[int(index) for index in ((final or {}).get("failed_indices") or []) if str(index).isdigit()],
+                *[int(index) for index in item.get("image_errors", {}) if str(index).isdigit()],
+            })
             raise RuntimeError((final or {}).get("error") or "图片生成未全部完成")
         item.update({
             "status": "completed",
             "image_status": "completed",
             "error": None,
+            "image_errors": {},
+            "failed_indices": [],
             "progress": {"current": len(item["pages"]), "total": len(item["pages"]), "percent": 100},
             "updated_at": series_service._now(),
         })
@@ -292,6 +352,108 @@ def _run_generation(project_id: str, item_ids: List[str]) -> None:
     except Exception as exc:
         logger.exception("系列后台生成任务异常: project=%s", project_id)
         _settle_background_failure(project_id, item_ids, exc)
+    finally:
+        with _active_lock:
+            _active_projects.discard(project_id)
+
+
+def _run_retry_failed_item(project_id: str, item_id: str) -> None:
+    """只补生成系列子作品缺失的图片，不重新生成已成功页面。"""
+    try:
+        project = series_service.get_project(project_id)
+        if not project:
+            return
+        item = series_service.get_project_item(project, item_id)
+        record_id = item.get("record_id")
+        history = get_history_service()
+        record = history.get_record(record_id, sync_images=True) if record_id else None
+        if not record:
+            raise ValueError("该子主题没有可恢复的历史成品")
+        task_id = (record.get("images") or {}).get("task_id")
+        if not task_id:
+            raise ValueError("该子主题没有图片任务记录")
+        generated = (record.get("images") or {}).get("generated") or []
+        pages = [
+            page for page in (record.get("outline") or {}).get("pages", [])
+            if not (isinstance(page.get("index"), int) and page["index"] < len(generated) and generated[page["index"]])
+        ]
+        if not pages:
+            item.update({
+                "status": "completed",
+                "image_status": "completed",
+                "error": None,
+                "image_errors": {},
+                "failed_indices": [],
+                "progress": {"current": len(generated), "total": len(record.get("outline", {}).get("pages", [])), "percent": 100},
+                "updated_at": series_service._now(),
+            })
+            _update_project_progress(project)
+            return
+
+        snapshot = item.get("template_snapshot") or series_service.get_template(project["template_id"])
+        references = series_service.read_reference_bytes(snapshot) if snapshot else []
+        item.setdefault("image_errors", {})
+        for page in pages:
+            item["image_errors"].setdefault(str(page["index"]), "该页图片生成失败，正在等待补全。")
+        item["failed_indices"] = sorted(page["index"] for page in pages)
+        item["progress"] = {
+            "current": sum(1 for filename in generated if filename),
+            "total": len(record.get("outline", {}).get("pages", [])),
+            "percent": round(sum(1 for filename in generated if filename) * 100 / max(1, len(record.get("outline", {}).get("pages", []))), 1),
+        }
+        series_service.save_project(project)
+
+        image_service = get_image_service()
+        for event in image_service.retry_failed_images(
+            task_id,
+            pages,
+            record_id=record_id,
+            series_context=item.get("series_context_snapshot") or _context(project, item).get("series_context", ""),
+            full_outline=item.get("outline", ""),
+            user_topic=item.get("topic", ""),
+            user_images=references or None,
+        ):
+            data = event.get("data") or {}
+            index = data.get("index")
+            if event.get("event") == "complete" and isinstance(index, int):
+                item.get("image_errors", {}).pop(str(index), None)
+                item["failed_indices"] = [value for value in item.get("failed_indices", []) if value != index]
+                current_record = history.get_record(record_id, sync_images=True) or record
+                current_generated = (current_record.get("images") or {}).get("generated") or []
+                total = len((current_record.get("outline") or {}).get("pages", []))
+                item["progress"] = {"current": sum(1 for filename in current_generated if filename), "total": total, "percent": round(sum(1 for filename in current_generated if filename) * 100 / max(1, total), 1)}
+                series_service.save_project(project)
+            elif event.get("event") == "error" and isinstance(index, int):
+                item.setdefault("image_errors", {})[str(index)] = data.get("error") or data.get("message") or "该页图片补全失败"
+                if index not in item.setdefault("failed_indices", []):
+                    item["failed_indices"].append(index)
+                item["failed_indices"] = sorted(set(item["failed_indices"]))
+                series_service.save_project(project)
+
+        current_record = history.get_record(record_id, sync_images=True) or record
+        current_generated = (current_record.get("images") or {}).get("generated") or []
+        total = len((current_record.get("outline") or {}).get("pages", []))
+        missing = [page["index"] for page in (current_record.get("outline") or {}).get("pages", []) if not (page["index"] < len(current_generated) and current_generated[page["index"]])]
+        item["failed_indices"] = missing
+        item["progress"] = {"current": total - len(missing), "total": total, "percent": round((total - len(missing)) * 100 / max(1, total), 1)}
+        if missing:
+            item["status"] = "failed"
+            item["image_status"] = "partial" if current_generated else "failed"
+            item["error"] = f"仍有 {len(missing)} 张图片未补全"
+        else:
+            item.update({"status": "completed", "image_status": "completed", "error": None, "image_errors": {}})
+        item["updated_at"] = series_service._now()
+        _update_project_progress(project)
+    except Exception as exc:
+        logger.exception("系列失败图片补全异常: project=%s item=%s", project_id, item_id)
+        project = series_service.get_project(project_id)
+        if project:
+            try:
+                item = series_service.get_project_item(project, item_id)
+                item.update({"status": "failed", "image_status": "failed", "error": str(exc), "updated_at": series_service._now()})
+                series_service.save_project(project)
+            except Exception:
+                logger.exception("保存系列失败图片补全状态失败: project=%s item=%s", project_id, item_id)
     finally:
         with _active_lock:
             _active_projects.discard(project_id)
@@ -660,6 +822,49 @@ def create_series_blueprint():
             return _ok(202, project=queued, item=item, message="子作品生成已开始")
         except RuntimeError as exc:
             return _error(str(exc), 409)
+
+    @blueprint.post("/series/projects/<project_id>/items/<item_id>/retry-failed")
+    def item_retry_failed(project_id: str, item_id: str):
+        try:
+            with _active_lock:
+                active_error = _active_project_error(project_id)
+                if active_error:
+                    return active_error
+                project, error = _project_or_error(project_id)
+                if error:
+                    return error
+                item, error = _item_or_error(project, item_id)
+                if error:
+                    return error
+                if not item.get("record_id"):
+                    return _error("该子主题还没有历史成品，无法补全图片")
+                record = get_history_service().get_record(item["record_id"])
+                if not record or not (record.get("images") or {}).get("task_id"):
+                    return _error("该子主题还没有图片任务，当前失败发生在文案或大纲阶段，请先修复后重新生成")
+                if item.get("status") in {"queued", "outlining", "generating", "running", "processing"}:
+                    return _error("该子主题已有图片任务正在执行，请等待完成", 409)
+                _active_projects.add(project_id)
+                item.update({"status": "generating", "image_status": "generating", "error": None})
+                project["status"] = "generating"
+                series_service.save_project(project)
+            thread = threading.Thread(
+                target=_run_retry_failed_item,
+                args=(project_id, item_id),
+                name=f"series-retry-{project_id}-{item_id}",
+                daemon=True,
+            )
+            try:
+                thread.start()
+            except Exception:
+                with _active_lock:
+                    _active_projects.discard(project_id)
+                raise
+            queued = series_service.get_project(project_id)
+            return _ok(202, project=series_service.project_with_template(queued), item=series_service.get_project_item(queued, item_id), message="失败图片补全已开始")
+        except RuntimeError as exc:
+            return _error(str(exc), 409)
+        except Exception as exc:
+            return _error(str(exc))
 
     @blueprint.post("/series/projects/<project_id>/outlines")
     def bulk_outlines(project_id: str):

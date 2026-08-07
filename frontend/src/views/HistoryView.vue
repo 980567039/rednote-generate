@@ -175,7 +175,7 @@ import GalleryCard from '../components/history/GalleryCard.vue'
 import ImageGalleryModal from '../components/history/ImageGalleryModal.vue'
 import OutlineModal from '../components/history/OutlineModal.vue'
 import ErrorCard from '../components/common/ErrorCard.vue'
-import { normalizeApiError, type AppError } from '../utils/errors'
+import { formatErrorMessage, normalizeApiError, type AppError } from '../utils/errors'
 import { seriesContextFromHistory } from '../composables/useGenerationRestore'
 
 const router = useRouter()
@@ -286,10 +286,12 @@ async function loadRecord(id: string) {
     if (generated.some(Boolean)) {
       const images: GeneratedImage[] = pages.map((page, idx) => {
         const filename = generated[page.index] || generated[idx] || ''
+        const imageError = res.record?.images.errors?.[String(page.index)] ?? res.record?.images.errors?.[String(idx)]
         return {
           index: page.index,
           url: filename && taskId ? `/api/images/${taskId}/${filename}` : '',
           status: filename ? 'done' : 'error',
+          error: filename ? undefined : (imageError ? formatErrorMessage(imageError, '图片生成失败') : '原始失败原因未保存，点击补全后会显示新的实时错误。'),
           retryable: !filename
         }
       })
@@ -317,7 +319,7 @@ async function loadRecord(id: string) {
         content: res.record.content
       })
     }
-    router.push('/outline')
+    router.push(generated.some(Boolean) && doneCount > 0 ? '/result' : '/outline')
   } else {
     error.value = normalizeApiError(res.error || res.error_message || '打开历史记录失败', '打开历史记录失败')
   }

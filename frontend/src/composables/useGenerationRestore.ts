@@ -6,6 +6,7 @@ import {
   type HistoryDetail,
   type SeriesRequestContext
 } from '../api'
+import { formatErrorMessage } from '../utils/errors'
 
 export function seriesContextFromHistory(
   record: HistoryDetail,
@@ -46,10 +47,12 @@ export function useGenerationRestore() {
 
     const images: GeneratedImage[] = pages.map((page, idx) => {
       const filename = generated[page.index] || generated[idx] || ''
+      const imageError = record.images.errors?.[String(page.index)] ?? record.images.errors?.[String(idx)]
       return {
         index: page.index,
         url: filename && taskId ? getImageUrl(taskId, filename) : '',
         status: filename ? 'done' : 'error',
+        error: filename ? undefined : (imageError ? formatErrorMessage(imageError, '图片生成失败') : '原始失败原因未保存，点击补全后会显示新的实时错误。'),
         retryable: !filename
       }
     })

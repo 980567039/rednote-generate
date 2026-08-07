@@ -49,6 +49,7 @@ export interface FinishEvent {
   completed?: number
   failed?: number
   failed_indices?: number[]
+  failed_errors?: Record<string, AppError | string>
   cached?: boolean
 }
 
@@ -82,6 +83,7 @@ export interface HistoryDetail {
   images: {
     task_id: string | null
     generated: string[]
+    errors?: Record<string, AppError | string>
   }
   content?: {
     titles: string[]
@@ -262,10 +264,14 @@ export interface SeriesProjectItem {
   pages: Page[]
   status: string
   outline_status?: string
+  content_status?: string
+  image_status?: string
   template_revision?: number
   template_snapshot?: SeriesTemplateSnapshot
   error?: AppError | string
   error_message?: string
+  failed_indices?: number[]
+  image_errors?: Record<string, AppError | string>
   progress?: SeriesProjectProgress | number
 }
 
