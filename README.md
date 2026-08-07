@@ -74,6 +74,8 @@ Docker 模式访问 http://localhost:12398。首次使用仍需在系统设置�
 
 Docker 会把 `data/` 挂载到宿主机，以保留注册账号和登录会话。通过 HTTPS 反向代理部署时，请设置 `REDINK_AUTH_COOKIE_SECURE=true`。
 
+生产环境可将 Cloudflare 的二级域名指向服务器，并由 `compose.production.yml` 中的 Caddy 提供 HTTPS 反向代理。Cloudflare 的 SSL/TLS 模式请设置为 `Full (strict)`；RedInk 容器本身继续只绑定服务器本机的 `12398` 端口。
+
 Docker 容器无法直接控制宿主机已登录的 Chrome，因此小红书发布功能默认只支持本机启动模式。
 
 停止 Docker 服务：

@@ -13,10 +13,17 @@ class Config:
     HOST = os.getenv('FLASK_HOST', '127.0.0.1')
     PORT = int(os.getenv('FLASK_PORT', '12398'))
     CORS_ORIGINS = [
-        'http://localhost:5173',
-        'http://127.0.0.1:5173',
-        'http://localhost:3000',
-        'http://127.0.0.1:3000',
+        origin.strip().rstrip('/')
+        for origin in os.getenv(
+            'REDINK_CORS_ORIGINS',
+            ','.join([
+                'http://localhost:5173',
+                'http://127.0.0.1:5173',
+                'http://localhost:3000',
+                'http://127.0.0.1:3000',
+            ]),
+        ).split(',')
+        if origin.strip()
     ]
     OUTPUT_DIR = 'output'
     AUTH_DB_PATH = os.getenv(
