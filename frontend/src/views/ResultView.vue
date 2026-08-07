@@ -76,14 +76,13 @@
                 v-if="canCreatePattern(image)"
                 class="hover-action-btn"
                 type="button"
-                :disabled="patternGeneratingIndex === image.index"
+                :disabled="patternModalVisible || patternGeneratingIndex !== null"
                 @click.stop="generatePattern(image)"
               >
                 {{ patternGeneratingIndex === image.index ? '生成图纸中…' : '生成拼豆图纸' }}
               </button>
             </div>
           </div>
-
           <!-- Action Bar -->
           <div style="padding: 12px; border-top: 1px solid #f0f0f0; display: flex; justify-content: space-between; align-items: center;">
             <span style="font-size: 12px; color: var(--text-sub);">Page {{ image.index + 1 }}</span>
@@ -100,7 +99,7 @@
                 v-if="canCreatePattern(image)"
                 style="border: none; background: none; color: var(--primary); cursor: pointer; font-size: 12px;"
                 type="button"
-                :disabled="patternGeneratingIndex === image.index"
+                :disabled="patternModalVisible || patternGeneratingIndex !== null"
                 @click="generatePattern(image)"
               >
                 {{ patternGeneratingIndex === image.index ? '生成中…' : '拼豆图纸' }}
@@ -142,18 +141,21 @@
       :image-count="store.images.length"
       @close="showPublishModal = false"
     />
-    <div v-if="patternPending" class="pattern-confirm-backdrop" role="presentation" @click.self="cancelPatternAppend">
-      <section class="pattern-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="pattern-confirm-title">
-        <h2 id="pattern-confirm-title">拼豆图纸已生成</h2>
-        <p>是否将这张图纸追加到该子主题的最后一张图片？确认后才会写入历史记录和发布序列。</p>
-        <div class="pattern-confirm-actions">
-          <button class="btn btn-secondary" type="button" :disabled="isAppendingPattern" @click="cancelPatternAppend">暂不追加</button>
-          <button class="btn btn-primary" type="button" :disabled="isAppendingPattern" @click="confirmPatternAppend">
-            {{ isAppendingPattern ? '追加中…' : '确认追加' }}
-          </button>
-        </div>
-      </section>
-    </div>
+    <PatternGenerationModal
+      :visible="patternModalVisible"
+      :step="patternModalStep"
+      :page-number="(patternTarget?.index ?? 0) + 1"
+      :progress="patternProgress"
+      :preview-url="patternPreviewUrl"
+      :metadata="patternPending?.result.metadata ?? null"
+      :error-message="patternErrorMessage"
+      :is-refining="isRefiningPattern"
+      :is-appending="isAppendingPattern"
+      @close="cancelPatternFlow"
+      @start="startAutomaticPattern"
+      @refine="refinePatternWithPerler"
+      @append="confirmPatternAppend"
+    />
   </div>
 </template>
 
@@ -216,15 +218,10 @@
 .result-actions-wrap { display: grid; justify-items: end; gap: 6px; }
 .result-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 12px; }
 .publish-disabled-hint { margin: 0; color: var(--text-secondary); font-size: 12px; }
-.pattern-confirm-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 20px; background: rgba(15, 23, 42, 0.46); }
-.pattern-confirm-modal { width: min(420px, 100%); padding: 24px; border: 1px solid var(--border-color); border-radius: 14px; background: var(--bg-card); box-shadow: 0 18px 60px rgba(15, 23, 42, 0.22); }
-.pattern-confirm-modal h2 { margin: 0 0 10px; color: var(--text-main); font-size: 18px; }
-.pattern-confirm-modal p { margin: 0; color: var(--text-sub); font-size: 13px; line-height: 1.6; }
-.pattern-confirm-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }
 </style>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onUnmounted, ref, shallowRef } from 'vue'
 import { useRouter } from 'vue-router'
 import { useGeneratorStore } from '../stores/generator'
 import { appendPatternPage, regenerateImage } from '../api'
@@ -233,8 +230,17 @@ import ErrorCard from '../components/common/ErrorCard.vue'
 import ImagePreviewModal from '../components/common/ImagePreviewModal.vue'
 import RegenerateImageModal from '../components/common/RegenerateImageModal.vue'
 import PublishModal from '../components/result/PublishModal.vue'
+import PatternGenerationModal from '../components/result/PatternGenerationModal.vue'
 import { normalizeApiError, type AppError } from '../utils/errors'
-import { generatePatternWithPerler, type PerlerPatternResult } from '../integrations/perlerBridge'
+import {
+  generatePatternAutomatically,
+  generatePatternWithPerler,
+  PerlerBridgeCancelledError,
+  type PerlerAutoJob,
+  type PerlerPatternResult,
+  type PerlerProgressUpdate,
+} from '../integrations/perlerBridge'
+import { DEFAULT_PERLER_SETTINGS, type PerlerPatternSettings } from '../integrations/perlerSettings'
 
 const router = useRouter()
 const store = useGeneratorStore()
@@ -245,10 +251,16 @@ const regenerateTarget = ref<any | null>(null)
 const showPublishModal = ref(false)
 const patternGeneratingIndex = ref<number | null>(null)
 const isAppendingPattern = ref(false)
+const isRefiningPattern = ref(false)
 const patternPending = ref<{ sourceImageIndex: number; result: PerlerPatternResult } | null>(null)
-
-
-
+const patternTarget = ref<{ index: number; url: string } | null>(null)
+const patternModalStep = ref<'config' | 'progress' | 'preview'>('config')
+const patternProgress = ref<PerlerProgressUpdate | null>(null)
+const patternPreviewUrl = ref('')
+const patternErrorMessage = ref('')
+const patternSettings = ref<PerlerPatternSettings>({ ...DEFAULT_PERLER_SETTINGS })
+const activeAutoPatternJob = shallowRef<PerlerAutoJob | null>(null)
+const patternModalVisible = computed(() => patternTarget.value !== null)
 const canPublish = computed(() => Boolean(
   store.recordId
   && store.content.status === 'done'
@@ -314,28 +326,113 @@ const downloadAll = () => {
   }
 }
 
-const generatePattern = async (image: { index: number; url: string }) => {
-  if (!store.recordId || !canCreatePattern(image) || patternGeneratingIndex.value !== null) return
-  patternGeneratingIndex.value = image.index
+const generatePattern = (image: { index: number; url: string }) => {
+  if (
+    !store.recordId
+    || !canCreatePattern(image)
+    || patternGeneratingIndex.value !== null
+    || patternModalVisible.value
+  ) return
+  patternTarget.value = image
+  patternModalStep.value = 'config'
+  patternProgress.value = null
+  patternErrorMessage.value = ''
+}
+
+function revokePatternPreview() {
+  if (!patternPreviewUrl.value) return
+  URL.revokeObjectURL(patternPreviewUrl.value)
+  patternPreviewUrl.value = ''
+}
+
+function setPatternPreview(result: PerlerPatternResult) {
+  revokePatternPreview()
+  patternPreviewUrl.value = URL.createObjectURL(result.pattern)
+}
+
+const startAutomaticPattern = async (settings: PerlerPatternSettings) => {
+  const target = patternTarget.value
+  if (!target || !store.recordId || activeAutoPatternJob.value || isRefiningPattern.value) return
+  patternSettings.value = { ...settings }
+  patternModalStep.value = 'progress'
+  patternProgress.value = { stage: 'connect', completed: 0, total: 1 }
+  patternGeneratingIndex.value = target.index
+  patternErrorMessage.value = ''
+  error.value = null
+  let job: PerlerAutoJob | null = null
+  try {
+    job = generatePatternAutomatically({
+      recordId: store.recordId,
+      imageIndex: target.index,
+      imageUrl: `${target.url.split('?')[0]}?thumbnail=false`,
+      fileName: `redink-page-${target.index + 1}.png`,
+      settings,
+      onReady: () => {
+        patternProgress.value = { stage: 'prepare', completed: 0, total: 1 }
+      },
+      onProgress: progress => {
+        patternProgress.value = progress
+      },
+    })
+    activeAutoPatternJob.value = job
+    const result = await job.result
+    if (activeAutoPatternJob.value !== job || patternTarget.value?.index !== target.index) return
+    patternPending.value = { sourceImageIndex: target.index, result }
+    setPatternPreview(result)
+    patternModalStep.value = 'preview'
+  } catch (reason: unknown) {
+    if (reason instanceof PerlerBridgeCancelledError) return
+    if (job && activeAutoPatternJob.value !== job) return
+    patternModalStep.value = 'config'
+    patternErrorMessage.value = reason instanceof Error ? reason.message : '生成拼豆图纸失败。'
+    error.value = normalizeApiError(reason, '生成拼豆图纸失败')
+  } finally {
+    if (!job || activeAutoPatternJob.value === job) {
+      activeAutoPatternJob.value = null
+      patternGeneratingIndex.value = null
+    }
+  }
+}
+
+const cancelPatternFlow = () => {
+  if (isAppendingPattern.value || isRefiningPattern.value) return
+  activeAutoPatternJob.value?.cancel()
+  activeAutoPatternJob.value = null
+  patternGeneratingIndex.value = null
+  patternPending.value = null
+  patternTarget.value = null
+  patternModalStep.value = 'config'
+  patternProgress.value = null
+  patternErrorMessage.value = ''
+  revokePatternPreview()
+}
+
+const refinePatternWithPerler = async () => {
+  const pending = patternPending.value
+  const target = patternTarget.value
+  if (!pending || !target || !store.recordId || isRefiningPattern.value || isAppendingPattern.value) return
+  isRefiningPattern.value = true
+  patternGeneratingIndex.value = target.index
+  patternErrorMessage.value = ''
   error.value = null
   try {
     const result = await generatePatternWithPerler({
       recordId: store.recordId,
-      imageIndex: image.index,
-      imageUrl: `${image.url.split('?')[0]}?thumbnail=false`,
-      fileName: `redink-page-${image.index + 1}.png`
+      imageIndex: target.index,
+      imageUrl: `${target.url.split('?')[0]}?thumbnail=false`,
+      fileName: `redink-page-${target.index + 1}.png`,
+      settings: patternSettings.value,
     })
-    patternPending.value = { sourceImageIndex: image.index, result }
-  } catch (reason: any) {
-    error.value = normalizeApiError(reason, '生成拼豆图纸失败')
+    if (patternTarget.value?.index !== target.index) return
+    patternPending.value = { sourceImageIndex: target.index, result }
+    setPatternPreview(result)
+  } catch (reason: unknown) {
+    patternErrorMessage.value = reason instanceof Error ? reason.message : 'Perler 精修失败，自动生成的预览已保留。'
+    error.value = normalizeApiError(reason, 'Perler 精修失败，自动生成的预览已保留')
   } finally {
+    isRefiningPattern.value = false
     patternGeneratingIndex.value = null
   }
-}
-
-const cancelPatternAppend = () => {
-  if (isAppendingPattern.value) return
-  patternPending.value = null
 }
 
 const confirmPatternAppend = async () => {
@@ -362,14 +459,25 @@ const confirmPatternAppend = async () => {
       return
     }
     store.appendPatternImage(page, response.filename)
-    patternPending.value = null
     error.value = null
+    patternPending.value = null
+    patternTarget.value = null
+    patternModalStep.value = 'config'
+    patternProgress.value = null
+    patternErrorMessage.value = ''
+    revokePatternPreview()
   } catch (reason: any) {
     error.value = normalizeApiError(reason, '追加拼豆图纸失败')
   } finally {
     isAppendingPattern.value = false
   }
 }
+
+onUnmounted(() => {
+  activeAutoPatternJob.value?.cancel()
+  activeAutoPatternJob.value = null
+  revokePatternPreview()
+})
 
 const openRegenerateDialog = (image: any) => {
   if (regeneratingIndex.value === null) regenerateTarget.value = image
