@@ -18,6 +18,7 @@
 - 子主题管理：合集内子主题可随时移除；删除只影响合集索引，已生成历史成品和图片仍会保留。
 - 外观设置：跟随系统、浅色和暗色主题。
 - 服务商设置：在系统设置中配置文本/图片模型、Base URL、端点和 API Key。
+- 站点登录：首次使用创建一个站点账号，之后通过 HttpOnly 会话登录访问工作台。
 - 小红书发布：在成品页检查标题、正文、标签和图片后，通过本机 Chrome 预填或自动提交。
 
 ## 技术栈
@@ -42,6 +43,8 @@
 
 - 前端：http://localhost:5173
 - 后端健康检查：http://localhost:12398/api/health
+
+首次打开工作台会进入注册页。创建首位站点账号后，注册入口自动关闭，后续使用该账号登录。密码使用 scrypt 派生后保存，会话 Cookie 不向前端 JavaScript 暴露；认证数据库位于本地 `data/auth.sqlite3`，已被 Git 忽略。
 
 按 `Ctrl+C` 或关闭启动窗口即可停止服务。也可以使用对应的 `scripts/start-linux.sh` 或 `scripts/start-windows.bat`。
 
@@ -68,6 +71,8 @@ docker compose up --build
 ```
 
 Docker 模式访问 http://localhost:12398。首次使用仍需在系统设置中填写模型服务商配置。
+
+Docker 会把 `data/` 挂载到宿主机，以保留注册账号和登录会话。通过 HTTPS 反向代理部署时，请设置 `REDINK_AUTH_COOKIE_SECURE=true`。
 
 Docker 容器无法直接控制宿主机已登录的 Chrome，因此小红书发布功能默认只支持本机启动模式。
 

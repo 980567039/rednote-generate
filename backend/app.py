@@ -60,6 +60,7 @@ def create_app():
             "origins": Config.CORS_ORIGINS,
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
             "allow_headers": ["Content-Type"],
+            "supports_credentials": True,
         }
     })
 

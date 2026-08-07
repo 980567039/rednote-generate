@@ -66,6 +66,11 @@ series/*/references/*
 /publish_config.yaml
 /publish_tasks.json
 
+# Local authentication database
+/data/auth.sqlite3
+/data/auth.sqlite3-shm
+/data/auth.sqlite3-wal
+
 # Logs
 *.log
 logs/

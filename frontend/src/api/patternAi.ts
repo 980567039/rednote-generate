@@ -1,4 +1,4 @@
-import { API_BASE_URL, readErrorResponse } from './client'
+import { API_BASE_URL, apiFetch, readErrorResponse } from './client'
 import type { PerlerPatternSettings } from '../integrations/perlerSettings'
 
 const MAX_SOURCE_BYTES = 25 * 1024 * 1024
@@ -42,7 +42,7 @@ async function responseError(response: Response, fallback: string): Promise<Erro
 
 export async function fetchPatternSource(imageUrl: string, signal?: AbortSignal): Promise<Blob> {
   const sourceUrl = new URL(imageUrl, window.location.origin)
-  const response = await fetch(sourceUrl.toString(), { credentials: 'same-origin', signal })
+  const response = await apiFetch(sourceUrl.toString(), { credentials: 'same-origin', signal })
   if (!response.ok) throw await responseError(response, `读取原图失败：HTTP ${response.status}`)
   const blob = await response.blob()
   assertPatternImage(blob, '原图')
@@ -70,7 +70,7 @@ export async function refinePatternImageWithAi(input: {
   form.append('source', input.source, `pattern-source.${normalizedMimeType(input.source).split('/')[1] || 'png'}`)
   if (input.patternPreview) form.append('pattern_preview', input.patternPreview, 'pattern-preview.png')
 
-  const response = await fetch(`${API_BASE_URL}/pattern/ai-refine`, {
+  const response = await apiFetch(`${API_BASE_URL}/pattern/ai-refine`, {
     method: 'POST',
     body: form,
     signal: input.signal,

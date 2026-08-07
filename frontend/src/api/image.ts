@@ -1,6 +1,7 @@
 import axios from 'axios'
 import {
   API_BASE_URL,
+  apiFetch,
   readErrorResponse,
   readSseResponse
 } from './client'
@@ -55,7 +56,7 @@ export async function retryFailedImages(
   series?: SeriesRequestContext
 ) {
   try {
-    const response = await fetch(`${API_BASE_URL}/retry-failed`, {
+    const response = await apiFetch(`${API_BASE_URL}/retry-failed`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -107,7 +108,7 @@ export async function generateImagesPost(
       ? await Promise.all(userImages.map(readFileAsDataUrl))
       : []
 
-    const response = await fetch(`${API_BASE_URL}/generate`, {
+    const response = await apiFetch(`${API_BASE_URL}/generate`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

@@ -1,4 +1,5 @@
 import { isValidPerlerSettings, type PerlerPatternSettings } from './perlerSettings'
+import { apiFetch } from '../api/client'
 
 const MANUAL_CHANNEL = 'redink-perler'
 const AUTO_CHANNEL = 'redink-perler-auto'
@@ -169,7 +170,7 @@ async function fetchSourceImage(imageUrl: string, signal?: AbortSignal): Promise
   mimeType: string
 }> {
   const sourceUrl = new URL(imageUrl, window.location.origin)
-  const response = await fetch(sourceUrl.toString(), { credentials: 'same-origin', signal })
+  const response = await apiFetch(sourceUrl.toString(), { credentials: 'same-origin', signal })
   if (!response.ok) throw new Error(`读取原图失败：HTTP ${response.status}`)
   const bytes = await response.arrayBuffer()
   if (bytes.byteLength === 0 || bytes.byteLength > MAX_SOURCE_BYTES) throw new Error('原图为空或超过 25MB。')

@@ -22,6 +22,7 @@ services:
     volumes:
       - ./history:/app/history
       - ./output:/app/output
+      - ./data:/app/data
       - ./series:/app/series
       - ./text_providers.yaml:/app/text_providers.yaml
       - ./image_providers.yaml:/app/image_providers.yaml

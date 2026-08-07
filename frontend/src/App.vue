@@ -1,5 +1,7 @@
 <template>
-  <div id="app">
+  <div id="app" :class="{ 'auth-shell': isPublicRoute }">
+    <RouterView v-if="isPublicRoute" />
+    <template v-else>
     <!-- 侧边栏 Sidebar -->
     <aside class="layout-sidebar">
       <nav class="nav-menu">
@@ -20,19 +22,26 @@
           系统设置
         </RouterLink>
       </nav>
+      <UserMenu />
     </aside>
 
     <!-- 主内容区 -->
     <main class="layout-main">
       <RouterView />
     </main>
+    </template>
   </div>
 </template>
 
 <script setup lang="ts">
 import { RouterView, RouterLink } from 'vue-router'
-import { onMounted } from 'vue'
+import { useRoute } from 'vue-router'
+import { computed, onMounted } from 'vue'
 import { setupAutoSave } from './stores/generator'
+import UserMenu from './components/common/UserMenu.vue'
+
+const route = useRoute()
+const isPublicRoute = computed(() => route.meta.public === true)
 
 // 启用自动保存到 localStorage
 onMounted(() => {

@@ -31,11 +31,13 @@ def create_api_blueprint():
     from .trend_routes import create_trend_blueprint
     from .publish_routes import create_publish_blueprint
     from .series_routes import create_series_blueprint
+    from .auth_routes import create_auth_blueprint
 
     # 创建主 API 蓝图
     api_bp = Blueprint('api', __name__, url_prefix='/api')
 
     # 将子蓝图注册到主蓝图（不带额外前缀）
+    api_bp.register_blueprint(create_auth_blueprint())
     api_bp.register_blueprint(create_outline_blueprint())
     api_bp.register_blueprint(create_image_blueprint())
     api_bp.register_blueprint(create_history_blueprint())
@@ -57,6 +59,8 @@ def register_routes(app):
     """
     api_bp = create_api_blueprint()
     app.register_blueprint(api_bp)
+    from .auth_routes import install_auth_guard
+    install_auth_guard(app)
 
 
 __all__ = ['register_routes', 'create_api_blueprint']
