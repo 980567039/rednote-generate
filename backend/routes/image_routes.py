@@ -26,7 +26,13 @@ from backend.services.pattern_ai import (
     validate_pattern_preview,
     validate_source_image,
 )
-from backend.services.series import build_context, get_template, series_context_from_payload
+from backend.services.series import (
+    build_context,
+    frozen_context_matches_mode,
+    get_template,
+    resolve_content_mode,
+    series_context_from_payload,
+)
 from .utils import (
     api_error_response,
     log_request,
@@ -66,7 +72,26 @@ def _series_context_for_request(data, record_id=None, topic=""):
         except Exception:
             record = None
     snapshot = (record or {}).get("series_template_snapshot")
+    requested_mode = data.get("content_mode")
+    has_requested_mode = requested_mode is not None and str(requested_mode).strip() != ""
     if snapshot:
+        stored_context = (record or {}).get("series_context_snapshot") or ""
+        stored_mode = (record or {}).get("series_content_mode")
+        if not stored_mode:
+            stored_mode = snapshot.get("content_mode")
+        # A caller-provided mode is authoritative.  If it is absent, recover
+        # the mode from the frozen record/snapshot and finally from the legacy
+        # human-readable marker.
+        inferred_mode = resolve_content_mode(
+            requested_mode if has_requested_mode else stored_mode,
+            snapshot,
+            stored_context,
+        )
+        context = (
+            stored_context
+            if frozen_context_matches_mode(stored_context, inferred_mode)
+            else build_context(snapshot, topic, record.get("series_item_index"), inferred_mode)["series_context"]
+        )
         result.update({
             "series_id": record.get("series_id"),
             "series_project_id": record.get("series_project_id") or record.get("series_id"),
@@ -74,9 +99,31 @@ def _series_context_for_request(data, record_id=None, topic=""):
             "series_template_id": snapshot.get("id"),
             "series_item_index": record.get("series_item_index"),
             "series_item_title": record.get("series_item_title") or topic,
-            "content_mode": record.get("series_content_mode", snapshot.get("content_mode", "story")),
-            "series_context": record.get("series_context_snapshot") or build_context(snapshot, topic, record.get("series_item_index"), record.get("series_content_mode", snapshot.get("content_mode", "story")))["series_context"],
+            "content_mode": inferred_mode,
+            "series_context": context,
             "series_template": snapshot,
+        })
+        return result
+    # Some very early records have a frozen context but no template snapshot.
+    # Preserve that context while still recovering its content direction.
+    if record and (record.get("series_context_snapshot") or record.get("series_content_mode")):
+        stored_context = record.get("series_context_snapshot") or ""
+        inferred_mode = resolve_content_mode(
+            requested_mode if has_requested_mode else record.get("series_content_mode"),
+            None,
+            stored_context,
+        )
+        # 没有模板快照时无法完整重建系列规则；至少不要把与显式模式
+        # 相反的旧文本继续传给图片模型。保留同向旧上下文以兼容历史任务。
+        context = stored_context if frozen_context_matches_mode(stored_context, inferred_mode) else ""
+        result.update({
+            "series_id": record.get("series_id"),
+            "series_project_id": record.get("series_project_id") or record.get("series_id"),
+            "series_item_id": record.get("series_item_id"),
+            "series_item_index": record.get("series_item_index"),
+            "series_item_title": record.get("series_item_title") or topic,
+            "content_mode": inferred_mode,
+            "series_context": context,
         })
         return result
     if data.get("series_project_id") and data.get("series_item_id"):
@@ -85,11 +132,16 @@ def _series_context_for_request(data, record_id=None, topic=""):
     template_id = data.get("series_template_id") or (record or {}).get("series_template_id")
     template = get_template(template_id) if template_id else None
     if template:
+        inferred_mode = resolve_content_mode(
+            requested_mode if has_requested_mode else (record or {}).get("series_content_mode"),
+            template,
+            (record or {}).get("series_context_snapshot", ""),
+        )
         result.update(build_context(
             template,
             data.get("series_item_title") or (record or {}).get("series_item_title") or topic,
             data.get("series_item_index") if data.get("series_item_index") is not None else (record or {}).get("series_item_index"),
-            data.get("content_mode", (record or {}).get("series_content_mode", "story")),
+            inferred_mode,
         ))
         result["series_id"] = data.get("series_id") or (record or {}).get("series_id")
     return result
@@ -398,7 +450,9 @@ def create_image_blueprint():
             page = data.get('page')
             use_reference = data.get('use_reference', True)
             record_id = data.get('record_id')
-            series_context = _series_context_for_request(data, record_id).get("series_context", "")
+            series_data = _series_context_for_request(data, record_id)
+            series_context = series_data.get("series_context", "")
+            content_mode = series_data.get("content_mode") or ""
 
             log_request('/retry', {
                 'task_id': task_id,
@@ -421,6 +475,7 @@ def create_image_blueprint():
                 use_reference,
                 record_id=record_id,
                 series_context=series_context,
+                **({"content_mode": content_mode} if content_mode else {}),
             )
 
             if result["success"]:
@@ -456,7 +511,9 @@ def create_image_blueprint():
             task_id = data.get('task_id')
             pages = data.get('pages')
             record_id = data.get('record_id')
-            series_context = _series_context_for_request(data, record_id).get("series_context", "")
+            series_data = _series_context_for_request(data, record_id)
+            series_context = series_data.get("series_context", "")
+            content_mode = series_data.get("content_mode") or ""
 
             log_request('/retry-failed', {
                 'task_id': task_id,
@@ -477,7 +534,11 @@ def create_image_blueprint():
             def generate():
                 """SSE 事件生成器"""
                 for event in image_service.retry_failed_images(
-                    task_id, pages, record_id=record_id, series_context=series_context
+                    task_id,
+                    pages,
+                    record_id=record_id,
+                    series_context=series_context,
+                    **({"content_mode": content_mode} if content_mode else {}),
                 ):
                     event_type = event["event"]
                     event_data = _normalize_sse_error(
@@ -532,7 +593,9 @@ def create_image_blueprint():
             user_topic = data.get('user_topic', '')
             record_id = data.get('record_id')
             revision_request = data.get('revision_request', '')
-            series_context = _series_context_for_request(data, record_id, user_topic).get("series_context", "")
+            series_data = _series_context_for_request(data, record_id, user_topic)
+            series_context = series_data.get("series_context", "")
+            content_mode = series_data.get("content_mode") or ""
             if not isinstance(revision_request, str):
                 revision_request = ''
             revision_request = revision_request.strip()[:500]
@@ -559,6 +622,7 @@ def create_image_blueprint():
                 record_id=record_id,
                 revision_request=revision_request,
                 series_context=series_context,
+                **({"content_mode": content_mode} if content_mode else {}),
             )
 
             if result["success"]:

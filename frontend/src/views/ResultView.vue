@@ -180,11 +180,8 @@
       :page-number="(patternTarget?.index ?? 0) + 1"
       :progress="patternProgress"
       :preview-url="patternPreviewUrl"
-      :before-preview-url="patternBeforePreviewUrl"
       :metadata="patternPending?.result.metadata ?? null"
       :error-message="patternErrorMessage"
-      :ai-enhanced="patternAiEnhanced"
-      :warnings="patternAiWarnings"
       :is-refining="isRefiningPattern"
       :is-appending="isAppendingPattern"
       @close="cancelPatternFlow"
@@ -278,8 +275,6 @@ import { useRouter } from 'vue-router'
 import { useGeneratorStore } from '../stores/generator'
 import {
   appendPatternPage,
-  fetchPatternSource,
-  refinePatternImageWithAi,
   regenerateImage,
 } from '../api'
 import ContentDisplay from '../components/result/ContentDisplay.vue'
@@ -313,22 +308,14 @@ const isRefiningPattern = ref(false)
 const patternPending = ref<{
   sourceImageIndex: number
   result: PerlerPatternResult
-  beforeResult?: PerlerPatternResult
-  manualSource?: Blob
-  aiEnhanced: boolean
-  warnings: string[]
 } | null>(null)
 const patternTarget = ref<{ index: number; url: string } | null>(null)
 const patternModalStep = ref<'config' | 'progress' | 'preview'>('config')
 const patternProgress = ref<PerlerProgressUpdate | null>(null)
 const patternPreviewUrl = ref('')
-const patternBeforePreviewUrl = ref('')
 const patternErrorMessage = ref('')
-const patternAiWarnings = ref<string[]>([])
-const patternAiEnhanced = ref(false)
 const patternSettings = ref<PerlerPatternSettings>({ ...DEFAULT_PERLER_SETTINGS })
 const activeAutoPatternJob = shallowRef<PerlerAutoJob | null>(null)
-const patternAbortController = shallowRef<AbortController | null>(null)
 let patternPipelineId = 0
 const patternModalVisible = computed(() => patternTarget.value !== null)
 const failedImages = computed(() => store.images.filter(image => image.status !== 'done' || !image.url))
@@ -417,36 +404,24 @@ const generatePattern = (image: { index: number; url: string }) => {
   patternModalStep.value = 'config'
   patternProgress.value = null
   patternErrorMessage.value = ''
-  patternAiWarnings.value = []
-  patternAiEnhanced.value = false
 }
 
-function revokePatternPreviews() {
+function revokePatternPreview() {
   if (patternPreviewUrl.value) URL.revokeObjectURL(patternPreviewUrl.value)
-  if (patternBeforePreviewUrl.value) URL.revokeObjectURL(patternBeforePreviewUrl.value)
   patternPreviewUrl.value = ''
-  patternBeforePreviewUrl.value = ''
 }
 
-function setPatternPreview(result: PerlerPatternResult, beforeResult?: PerlerPatternResult) {
-  revokePatternPreviews()
-  patternPreviewUrl.value = URL.createObjectURL(result.pattern)
-  if (beforeResult) patternBeforePreviewUrl.value = URL.createObjectURL(beforeResult.pattern)
-}
-
-function patternFailureMessage(reason: unknown): string {
-  if (reason instanceof Error && reason.message.trim()) return reason.message.trim().slice(0, 240)
-  return '未知错误'
+function setPatternPreview(result: PerlerPatternResult) {
+  revokePatternPreview()
+  // Perler returns two deliberate representations: `preview` is the clean,
+  // no-grid bead rendering for visual review, while `pattern` is the
+  // construction master that must be persisted after confirmation.
+  patternPreviewUrl.value = URL.createObjectURL(result.preview ?? result.pattern)
 }
 
 function isCancelledPatternReason(reason: unknown): boolean {
   return reason instanceof PerlerBridgeCancelledError
     || (reason instanceof DOMException && reason.name === 'AbortError')
-}
-
-function disablesPatternAi(reason: unknown): boolean {
-  const message = patternFailureMessage(reason)
-  return message.includes('不支持参考图AI精修') || message.includes('未配置图片生成服务商')
 }
 
 const startAutomaticPattern = async (settings: PerlerPatternSettings) => {
@@ -455,135 +430,49 @@ const startAutomaticPattern = async (settings: PerlerPatternSettings) => {
     !target
     || !store.recordId
     || activeAutoPatternJob.value
-    || patternAbortController.value
     || isRefiningPattern.value
   ) return
   const recordId = store.recordId
   const pipelineId = ++patternPipelineId
-  const abortController = new AbortController()
-  patternAbortController.value = abortController
-  const warnings: string[] = []
-  let aiAvailable = true
-  let sourceAiEnhanced = false
   patternSettings.value = { ...settings }
   patternModalStep.value = 'progress'
-  patternProgress.value = { stage: 'ai-source', completed: 0, total: 1 }
+  patternProgress.value = { stage: 'connect', completed: 0, total: 1 }
   patternGeneratingIndex.value = target.index
   patternErrorMessage.value = ''
-  patternAiWarnings.value = []
-  patternAiEnhanced.value = false
   error.value = null
 
   const isCurrent = () => (
     patternPipelineId === pipelineId
     && patternTarget.value?.index === target.index
-    && !abortController.signal.aborted
   )
-  const runPerler = async (source: Blob, stage: 'base-pattern' | 'final-pattern') => {
-    if (!isCurrent()) throw new PerlerBridgeCancelledError()
-    patternProgress.value = { stage, completed: 0, total: 1 }
+
+  try {
+    // Match Perler-to-perfect's AutoMode: hand the original raster to the
+    // deterministic worker once. There is no AI redraw before or after the
+    // grid conversion, so the preview and editable pattern share one source.
     const job = generatePatternAutomatically({
       recordId,
       imageIndex: target.index,
-      source,
+      imageUrl: `${target.url.split('?')[0]}?thumbnail=false`,
       fileName: `redink-page-${target.index + 1}.png`,
       settings,
       onReady: () => {
-        if (isCurrent()) patternProgress.value = { stage, completed: 0, total: 1 }
+        if (isCurrent()) patternProgress.value = { stage: 'prepare', completed: 0, total: 1 }
       },
       onProgress: progress => {
-        if (isCurrent()) {
-          patternProgress.value = { stage, completed: progress.completed, total: progress.total }
-        }
+        if (isCurrent()) patternProgress.value = progress
       },
     })
     activeAutoPatternJob.value = job
-    try {
-      const result = await job.result
-      if (!isCurrent()) throw new PerlerBridgeCancelledError()
-      return result
-    } finally {
-      if (activeAutoPatternJob.value === job) activeAutoPatternJob.value = null
-    }
-  }
-
-  try {
-    const originalSource = await fetchPatternSource(
-      `${target.url.split('?')[0]}?thumbnail=false`,
-      abortController.signal,
-    )
+    const result = await job.result
     if (!isCurrent()) return
-
-    let preparedSource = originalSource
-    try {
-      preparedSource = await refinePatternImageWithAi({
-        stage: 'source',
-        source: originalSource,
-        settings,
-        signal: abortController.signal,
-      })
-      sourceAiEnhanced = true
-      patternProgress.value = { stage: 'ai-source', completed: 1, total: 1 }
-    } catch (reason: unknown) {
-      if (isCancelledPatternReason(reason)) throw reason
-      aiAvailable = !disablesPatternAi(reason)
-      warnings.push(`素材AI优化未完成，已使用原图继续：${patternFailureMessage(reason)}`)
-    }
-
-    let baseResult: PerlerPatternResult
-    try {
-      baseResult = await runPerler(preparedSource, 'base-pattern')
-    } catch (reason: unknown) {
-      if (!sourceAiEnhanced || isCancelledPatternReason(reason)) throw reason
-      warnings.push(`AI素材无法转换，已改用原图生成104精细基础版：${patternFailureMessage(reason)}`)
-      preparedSource = originalSource
-      sourceAiEnhanced = false
-      baseResult = await runPerler(originalSource, 'base-pattern')
-    }
-    let result = baseResult
-    let beforeResult: PerlerPatternResult | undefined
-    let manualSource = preparedSource
-    let patternStageAiEnhanced = false
-
-    if (aiAvailable && baseResult.preview) {
-      try {
-        patternProgress.value = { stage: 'ai-pattern', completed: 0, total: 1 }
-        const refinedPatternSource = await refinePatternImageWithAi({
-          stage: 'pattern',
-          source: originalSource,
-          patternPreview: baseResult.preview,
-          settings,
-          signal: abortController.signal,
-        })
-        if (!isCurrent()) return
-        patternProgress.value = { stage: 'ai-pattern', completed: 1, total: 1 }
-        const finalResult = await runPerler(refinedPatternSource, 'final-pattern')
-        manualSource = refinedPatternSource
-        beforeResult = baseResult
-        result = finalResult
-        patternStageAiEnhanced = true
-      } catch (reason: unknown) {
-        if (isCancelledPatternReason(reason)) throw reason
-        warnings.push(`格子AI精修未完成，已保留104精细基础版：${patternFailureMessage(reason)}`)
-      }
-    } else if (!baseResult.preview) {
-      warnings.push('当前 Perler 未回传无网格效果图，已保留104精细基础版。')
-    }
-
-    if (!isCurrent()) return
-    const aiEnhanced = sourceAiEnhanced || patternStageAiEnhanced
     patternPending.value = {
       sourceImageIndex: target.index,
       result,
-      beforeResult,
-      manualSource,
-      aiEnhanced,
-      warnings: [...warnings],
     }
-    patternAiWarnings.value = [...warnings]
-    patternAiEnhanced.value = aiEnhanced
-    setPatternPreview(result, beforeResult)
+    setPatternPreview(result)
     patternModalStep.value = 'preview'
+    activeAutoPatternJob.value = null
   } catch (reason: unknown) {
     if (isCancelledPatternReason(reason)) return
     if (!isCurrent()) return
@@ -592,7 +481,7 @@ const startAutomaticPattern = async (settings: PerlerPatternSettings) => {
     error.value = normalizeApiError(reason, '生成拼豆图纸失败')
   } finally {
     if (patternPipelineId === pipelineId) {
-      patternAbortController.value = null
+      activeAutoPatternJob.value = null
       patternGeneratingIndex.value = null
     }
   }
@@ -601,8 +490,6 @@ const startAutomaticPattern = async (settings: PerlerPatternSettings) => {
 const cancelPatternFlow = () => {
   if (isAppendingPattern.value || isRefiningPattern.value) return
   patternPipelineId += 1
-  patternAbortController.value?.abort()
-  patternAbortController.value = null
   activeAutoPatternJob.value?.cancel()
   activeAutoPatternJob.value = null
   patternGeneratingIndex.value = null
@@ -611,9 +498,7 @@ const cancelPatternFlow = () => {
   patternModalStep.value = 'config'
   patternProgress.value = null
   patternErrorMessage.value = ''
-  patternAiWarnings.value = []
-  patternAiEnhanced.value = false
-  revokePatternPreviews()
+  revokePatternPreview()
 }
 
 const refinePatternWithPerler = async () => {
@@ -628,20 +513,16 @@ const refinePatternWithPerler = async () => {
     const result = await generatePatternWithPerler({
       recordId: store.recordId,
       imageIndex: target.index,
-      ...(pending.manualSource
-        ? { source: pending.manualSource }
-        : { imageUrl: `${target.url.split('?')[0]}?thumbnail=false` }),
+      imageUrl: `${target.url.split('?')[0]}?thumbnail=false`,
       fileName: `redink-page-${target.index + 1}.png`,
       settings: patternSettings.value,
     })
     if (patternTarget.value?.index !== target.index) return
     patternPending.value = { ...pending, result }
-    patternAiWarnings.value = [...pending.warnings]
-    patternAiEnhanced.value = pending.aiEnhanced
-    setPatternPreview(result, pending.beforeResult)
+    setPatternPreview(result)
   } catch (reason: unknown) {
-    patternErrorMessage.value = reason instanceof Error ? reason.message : 'Perler 精修失败，自动生成的预览已保留。'
-    error.value = normalizeApiError(reason, 'Perler 精修失败，自动生成的预览已保留')
+    patternErrorMessage.value = reason instanceof Error ? reason.message : 'Perler 编辑未完成，自动生成的预览已保留。'
+    error.value = normalizeApiError(reason, 'Perler 编辑未完成，自动生成的预览已保留')
   } finally {
     isRefiningPattern.value = false
     patternGeneratingIndex.value = null
@@ -678,9 +559,7 @@ const confirmPatternAppend = async () => {
     patternModalStep.value = 'config'
     patternProgress.value = null
     patternErrorMessage.value = ''
-    patternAiWarnings.value = []
-    patternAiEnhanced.value = false
-    revokePatternPreviews()
+    revokePatternPreview()
   } catch (reason: any) {
     error.value = normalizeApiError(reason, '追加拼豆图纸失败')
   } finally {
@@ -690,11 +569,9 @@ const confirmPatternAppend = async () => {
 
 onUnmounted(() => {
   patternPipelineId += 1
-  patternAbortController.value?.abort()
-  patternAbortController.value = null
   activeAutoPatternJob.value?.cancel()
   activeAutoPatternJob.value = null
-  revokePatternPreviews()
+  revokePatternPreview()
 })
 
 const openRegenerateDialog = (image: any) => {

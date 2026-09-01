@@ -36,6 +36,212 @@ def make_history_service(tmp_path: Path) -> HistoryService:
     return service
 
 
+def test_legacy_character_record_keeps_marker_fallback(monkeypatch):
+    legacy_record = {
+        "series_id": "series_legacy",
+        "series_template_snapshot": {
+            "id": "template_legacy",
+            "page_structure": {"preset": "character_sheet", "page_count": 1},
+        },
+        "series_context_snapshot": "内容方向：精细角色图（单张）",
+    }
+
+    class FakeHistoryService:
+        def get_record(self, record_id):
+            assert record_id == "record_legacy"
+            return legacy_record
+
+    monkeypatch.setattr(
+        image_routes,
+        "get_history_service",
+        lambda: FakeHistoryService(),
+    )
+
+    context = image_routes._series_context_for_request({}, "record_legacy")
+
+    assert context["content_mode"] == "character_sheet"
+    assert "内容方向：精细角色图" in context["series_context"]
+
+
+def test_legacy_character_snapshot_recovers_structured_mode():
+    """没有 content_mode 的旧条目仍应走角色图而不是故事分镜。"""
+    from backend.routes import series_routes
+
+    snapshot = {
+        "id": "template_legacy",
+        "page_structure": {"preset": "character_sheet", "page_count": 1},
+    }
+    project = {"id": "series_legacy", "template_id": snapshot["id"]}
+    item = {
+        "id": "item_legacy",
+        "topic": "孤独摇滚：后藤一里",
+        "template_snapshot": snapshot,
+        "series_context_snapshot": "",
+    }
+
+    context = series_routes._context(project, item)
+
+    assert context["content_mode"] == "character_sheet"
+    assert "精细角色图" in context["series_context"]
+
+
+def test_series_route_rebuilds_stale_context_when_explicit_mode_conflicts():
+    """系列生成链路不能复用与条目模式相反的旧冻结上下文。"""
+    from backend.routes import series_routes
+
+    snapshot = {
+        "id": "template_legacy",
+        "name": "旧合集",
+        "page_structure": {"preset": "standard", "page_count": 5},
+        "visual_style": "普通插画",
+        "palette": "自然色",
+        "composition": "3:4 竖版",
+        "character_bible": "角色保持一致",
+        "copy_tone": "简洁",
+    }
+    project = {"id": "series_legacy", "template_id": snapshot["id"]}
+    item = {
+        "id": "item_legacy",
+        "topic": "故事主题",
+        "content_mode": "story",
+        "template_snapshot": snapshot,
+        "series_context_snapshot": "内容方向：精细角色图（单张）",
+    }
+
+    context = series_routes._context(project, item)
+
+    assert context["content_mode"] == "story"
+    assert "内容方向：精细角色图" not in context["series_context"]
+    assert "内容方向：剧情小故事" in context["series_context"]
+
+
+def test_explicit_story_mode_rebuilds_stale_character_context(monkeypatch):
+    """显式故事请求不能再次携带旧角色合集规则。"""
+    legacy_record = {
+        "series_id": "series_legacy",
+        "series_template_snapshot": {
+            "id": "template_legacy",
+            "name": "旧合集",
+            "page_structure": {"preset": "character_sheet", "page_count": 1},
+        },
+        "series_content_mode": "character_sheet",
+        "series_context_snapshot": "内容方向：精细角色图（单张）",
+    }
+
+    class FakeHistoryService:
+        def get_record(self, record_id):
+            return legacy_record
+
+    monkeypatch.setattr(image_routes, "get_history_service", lambda: FakeHistoryService())
+
+    context = image_routes._series_context_for_request(
+        {"content_mode": "story"},
+        "record_legacy",
+        "故事主题",
+    )
+
+    assert context["content_mode"] == "story"
+    assert "内容方向：精细角色图" not in context["series_context"]
+    assert "剧情小故事" in context["series_context"]
+
+
+def test_legacy_record_without_template_drops_conflicting_context(monkeypatch):
+    """无模板快照的最旧记录也不能把角色规则带进显式故事重绘。"""
+    legacy_record = {
+        "series_id": "series_legacy",
+        "series_context_snapshot": "内容方向：精细角色图（单张）",
+        "series_content_mode": "character_sheet",
+    }
+
+    class FakeHistoryService:
+        def get_record(self, record_id):
+            return legacy_record
+
+    monkeypatch.setattr(image_routes, "get_history_service", lambda: FakeHistoryService())
+
+    context = image_routes._series_context_for_request(
+        {"content_mode": "story"},
+        "record_legacy",
+        "故事主题",
+    )
+
+    assert context["content_mode"] == "story"
+    assert context["series_context"] == ""
+
+
+def test_project_payload_drops_conflicting_frozen_context():
+    """项目条目读取路径和图片路由使用同一套冻结上下文校验。"""
+    from backend.services import series
+
+    original_get_project = series.get_project
+    original_get_template = series.get_template
+    snapshot = {
+        "id": "template_legacy",
+        "page_structure": {"preset": "standard", "page_count": 5},
+    }
+    project = {
+        "id": "series_legacy",
+        "template_id": snapshot["id"],
+        "items": [{
+            "id": "item_legacy",
+            "topic": "故事主题",
+            "content_mode": "story",
+            "template_snapshot": snapshot,
+            "series_context_snapshot": "内容方向：精细角色图（单张）",
+        }],
+    }
+    try:
+        series.get_project = lambda project_id: project  # type: ignore[assignment]
+        series.get_template = lambda template_id: snapshot  # type: ignore[assignment]
+        context = series.series_context_from_payload({
+            "series_project_id": "series_legacy",
+            "series_item_id": "item_legacy",
+        })
+    finally:
+        series.get_project = original_get_project  # type: ignore[assignment]
+        series.get_template = original_get_template  # type: ignore[assignment]
+
+    assert context["content_mode"] == "story"
+    assert "内容方向：精细角色图" not in context["series_context"]
+
+
+def test_legacy_character_history_context_is_restored_for_content_route(monkeypatch):
+    captured = {}
+    snapshot = {
+        "id": "template_legacy",
+        "name": "旧合集",
+        "page_structure": {"preset": "character_sheet", "page_count": 1},
+    }
+
+    class FakeHistory:
+        def get_record(self, record_id):
+            return {
+                "series_id": "series_legacy",
+                "series_template_snapshot": snapshot,
+                "series_context_snapshot": "",
+            }
+
+    class FakeContent:
+        def generate_content(self, topic, outline, **kwargs):
+            captured.update(kwargs)
+            return {"success": True, "titles": ["标题"], "copywriting": "正文", "tags": ["标签"]}
+
+    monkeypatch.setattr(content_routes, "get_history_service", lambda: FakeHistory())
+    monkeypatch.setattr(content_routes, "get_content_service", lambda: FakeContent())
+    app = Flask(__name__)
+    app.config["TESTING"] = True
+    app.register_blueprint(create_content_blueprint(), url_prefix="/api")
+
+    response = app.test_client().post(
+        "/api/content",
+        json={"topic": "孤独摇滚：后藤一里", "outline": "角色大纲", "record_id": "record_legacy"},
+    )
+
+    assert response.status_code == 200
+    assert captured["content_mode"] == "character_sheet"
+    assert "精细角色图" in captured["series_context"]
+
+
 @pytest.mark.parametrize(
     "topic",
     [

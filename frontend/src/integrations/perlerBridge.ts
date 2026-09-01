@@ -25,6 +25,9 @@ export interface PerlerPatternMetadata {
   columns: number
   rows: number
   usedColors: number
+  profile?: 'shape' | 'balanced' | 'detail'
+  algorithmVersion?: string
+  sourceKind?: 'original' | 'bead-source'
 }
 
 export interface PerlerPatternResult {
@@ -44,14 +47,8 @@ export type PerlerAutoProgressStage =
   | 'refine'
   | 'render'
 
-export type PatternPipelineProgressStage =
-  | 'ai-source'
-  | 'base-pattern'
-  | 'ai-pattern'
-  | 'final-pattern'
-
 export interface PerlerProgressUpdate {
-  stage: 'connect' | PerlerAutoProgressStage | PatternPipelineProgressStage
+  stage: 'connect' | PerlerAutoProgressStage
   completed: number
   total: number
 }
@@ -65,6 +62,7 @@ export interface PerlerAutoJob {
 interface PerlerMessage {
   channel: string
   version: number
+  protocolVersion?: number
   type: string
   requestId?: string
   pattern?: ArrayBuffer
@@ -376,6 +374,10 @@ export function generatePatternAutomatically(input: {
           {
             channel: AUTO_CHANNEL,
             version: VERSION,
+            // Keep the transport envelope at v1 while advertising the
+            // additive auto-output contract understood by Perler's current
+            // AutoMode. Older builds ignore this unknown field.
+            protocolVersion: 2,
             type: 'AUTO_GENERATE',
             requestId,
             context: {
@@ -387,6 +389,11 @@ export function generatePatternAutomatically(input: {
             mimeType: sourceMimeType,
             settings: {
               ...input.settings,
+              // Match Perler's current AutoMode defaults explicitly so the
+              // executed settings and the returned metadata cannot diverge.
+              profile: 'balanced',
+              sourceKind: 'original',
+              sourceImageIndex: input.imageIndex,
               removeBorderBackground: true,
             },
           },

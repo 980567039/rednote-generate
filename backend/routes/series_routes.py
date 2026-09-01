@@ -53,7 +53,24 @@ def _item_or_error(project: Dict[str, Any], item_id: str):
 
 def _context(project: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
     snapshot = item.get("template_snapshot") or series_service.get_template(project["template_id"])
-    content_mode = series_service.normalize_content_mode(item.get("content_mode", "story"))
+    content_mode = series_service.resolve_content_mode(
+        item.get("content_mode"),
+        snapshot,
+        item.get("series_context_snapshot", ""),
+    )
+    # 旧条目可能只有冻结的人类可读上下文；如果条目/模板模式后来被
+    # 显式切换，不能继续把相反方向的规则传给 outline/content/image。
+    frozen_context = item.get("series_context_snapshot") or ""
+    context = (
+        frozen_context
+        if series_service.frozen_context_matches_mode(frozen_context, content_mode)
+        else series_service.build_context(
+            snapshot,
+            item.get("topic", ""),
+            item.get("index"),
+            content_mode,
+        )["series_context"]
+    )
     return {
         "series_id": project["id"],
         "series_project_id": project["id"],
@@ -62,9 +79,21 @@ def _context(project: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
         "series_item_index": item.get("index"),
         "series_item_title": item.get("topic"),
         "content_mode": content_mode,
-        "series_context": item.get("series_context_snapshot") or series_service.build_context(snapshot, item.get("topic", ""), item.get("index"))["series_context"],
+        # Older project items may have a template snapshot but no frozen
+        # context.  Pass the item's explicit mode when rebuilding it so a
+        # character-sheet item cannot silently fall back to story rules.
+        "series_context": context,
         "series_template": snapshot,
     }
+
+
+def _item_content_mode(item: Dict[str, Any], template: Optional[Dict[str, Any]] = None) -> str:
+    """读取条目模式，兼容早期条目缺少结构化 content_mode 的情况。"""
+    return series_service.resolve_content_mode(
+        item.get("content_mode"),
+        item.get("template_snapshot") or template,
+        item.get("series_context_snapshot", ""),
+    )
 
 
 def _save_item_error(project: Dict[str, Any], item: Dict[str, Any], phase: str, exc: Exception) -> None:
@@ -80,7 +109,7 @@ def _generate_outline(project: Dict[str, Any], item: Dict[str, Any], outline_ser
     series_service.save_project(project)
     snapshot = item["template_snapshot"]
     try:
-        mode = series_service.normalize_content_mode(item.get("content_mode", "story"))
+        mode = _item_content_mode(item, snapshot)
         if mode == "character_sheet":
             # 角色图不需要模型先编造故事；每个角色生成一个独立页面和独立图片。
             names = item.get("character_names") or series_service.extract_character_names(item["topic"])
@@ -92,8 +121,7 @@ def _generate_outline(project: Dict[str, Any], item: Dict[str, Any], outline_ser
                     f"[{'封面' if index == 0 else '内容'}]\n精细角色设定图：{name}\n"
                     f"所属主题：{item['topic']}\n"
                     "本页只展示这一名角色，保持清晰的发型、服饰、面部特征、表情、姿态和标志性道具；"
-                    "采用系列固定像素风与色板，单张 3:4 竖版构图；不讲连续故事，不与其他角色合并成总览合照，"
-                    "不添加大段文字。"
+                    "不讲连续故事，不与其他角色合并成总览合照，不添加大段文字。"
                 ),
             } for index, name in enumerate(item["character_names"])]
             outline_text = "\n\n<page>\n\n".join(page["content"] for page in pages)
@@ -233,16 +261,20 @@ def _generate_item(project: Dict[str, Any], item: Dict[str, Any], history, conte
                 series_item_id=item.get("id"),
                 series_template_revision=item.get("template_revision"),
                 series_template_snapshot=snapshot,
-                series_context_snapshot=item.get("series_context_snapshot"),
+                # Persist the context after compatibility resolution. If an
+                # older item carried a stale context from the opposite mode,
+                # retaining it here would make later retries/history restores
+                # reintroduce those legacy rules.
+                series_context_snapshot=context.get("series_context", ""),
                 series_topic_source=item.get("topic_source"),
-                series_content_mode=item.get("content_mode", "story"),
+                series_content_mode=context.get("content_mode", _item_content_mode(item, snapshot)),
             )
             item["record_id"] = record_id
             series_service.save_project(project)
 
         content = content_service.generate_content(item["topic"], item.get("outline", ""), **context)
         if not content.get("success"):
-            if series_service.normalize_content_mode(item.get("content_mode", "story")) == "character_sheet":
+            if context.get("content_mode") == "character_sheet":
                 # 图片和文案是两个独立产物；角色图文案接口格式异常时，
                 # 使用确定性兜底文案继续生成图片，避免整篇作品被错误标记为“图片失败”。
                 logger.warning(
@@ -404,11 +436,17 @@ def _run_retry_failed_item(project_id: str, item_id: str) -> None:
         series_service.save_project(project)
 
         image_service = get_image_service()
+        # Re-resolve the item context before retrying.  Older records may carry
+        # a frozen context from the opposite content mode; using it directly
+        # would reintroduce the legacy pattern-generation rules and bypass the
+        # mode compatibility guard in ``_context``.
+        context = _context(project, item)
         for event in image_service.retry_failed_images(
             task_id,
             pages,
             record_id=record_id,
-            series_context=item.get("series_context_snapshot") or _context(project, item).get("series_context", ""),
+            series_context=context.get("series_context", ""),
+            content_mode=context.get("content_mode", _item_content_mode(item, snapshot)),
             full_outline=item.get("outline", ""),
             user_topic=item.get("topic", ""),
             user_images=references or None,
@@ -469,7 +507,7 @@ def _run_outline_generation(project_id: str, item_ids: List[str]) -> None:
         series_service.save_project(project)
         # 精细角色图使用确定性的单页大纲，不需要初始化文本模型；只有故事模式才加载服务。
         service = None
-        if any(series_service.normalize_content_mode(item.get("content_mode", "story")) == "story" for item in selected):
+        if any(_item_content_mode(item, item.get("template_snapshot")) == "story" for item in selected):
             service = get_outline_service()
         for item in selected:
             _generate_outline(project, item, service)

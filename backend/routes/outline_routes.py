@@ -10,7 +10,7 @@ import base64
 import logging
 from flask import Blueprint, request, jsonify
 from backend.services.outline import get_outline_service
-from backend.services.series import build_context, get_template, series_context_from_payload
+from backend.services.series import build_context, get_template, resolve_content_mode, series_context_from_payload
 from .utils import (
     api_error_response,
     log_request,
@@ -80,7 +80,8 @@ def create_outline_blueprint():
             else:
                 template = get_template(series_template_id) if series_template_id else None
                 if template:
-                    series_kwargs.update(build_context(template, series_item_title or topic, series_item_index, data.get("content_mode", "story")))
+                    mode = resolve_content_mode(data.get("content_mode"), template)
+                    series_kwargs.update(build_context(template, series_item_title or topic, series_item_index, mode))
 
             outline_service = get_outline_service()
             result = outline_service.generate_outline(topic, images if images else None, **series_kwargs)

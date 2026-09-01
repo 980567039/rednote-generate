@@ -52,52 +52,27 @@
       <div v-else class="pattern-body">
         <p v-if="errorMessage" class="pattern-error" role="alert">{{ errorMessage }}</p>
         <div class="pattern-preview-toolbar">
-          <div v-if="hasComparison" class="pattern-version-switch" role="group" aria-label="选择预览版本">
-            <button
-              type="button"
-              :class="{ active: activePreview === 'ai' }"
-              :aria-pressed="activePreview === 'ai'"
-              @click="activePreview = 'ai'"
-            >
-              AI 精修版
-            </button>
-            <button
-              type="button"
-              :class="{ active: activePreview === 'base' }"
-              :aria-pressed="activePreview === 'base'"
-              @click="activePreview = 'base'"
-            >
-              104 精细基础版
-            </button>
-          </div>
           <div class="pattern-preview-tools">
-            <span class="pattern-ai-badge" :class="{ enhanced: aiEnhanced }">
-              {{ aiEnhanced ? 'AI 已精修' : '104 精细基础版' }}
-            </span>
-            <button class="btn btn-secondary pattern-fullscreen-trigger" type="button" :disabled="!activePreviewUrl" @click="openFullscreen">
+            <span class="pattern-engine-badge">Perler 图纸预览</span>
+            <button class="btn btn-secondary pattern-fullscreen-trigger" type="button" :disabled="!previewUrl" @click="openFullscreen">
               全屏查看
             </button>
           </div>
         </div>
         <button
-          v-if="activePreviewUrl"
+          v-if="previewUrl"
           class="pattern-preview"
           type="button"
-          :aria-label="`全屏查看${activePreviewLabel}`"
+          aria-label="全屏查看拼豆图纸"
           @click="openFullscreen"
         >
-          <img :src="activePreviewUrl" :alt="`${activePreviewLabel}拼豆图纸预览`" />
+          <img :src="previewUrl" alt="Perler 拼豆图纸预览" />
           <span class="pattern-preview-hint">点击查看原始尺寸</span>
         </button>
         <div v-else class="pattern-preview pattern-preview-empty">
           暂无可预览的图纸
         </div>
-        <aside v-if="warnings.length" class="pattern-warnings" aria-label="生成提示">
-          <strong>生成提示</strong>
-          <ul>
-            <li v-for="(warning, index) in warnings" :key="`${index}-${warning}`">{{ warning }}</li>
-          </ul>
-        </aside>
+        <p v-if="previewUrl" class="pattern-preview-caption">自动结果优先展示无网格效果预览；确认追加后始终保存可施工的母版图纸。</p>
         <dl v-if="metadata" class="pattern-metadata">
           <div><dt>实际规格</dt><dd>{{ metadata.columns }} × {{ metadata.rows }}</dd></div>
           <div><dt>实际用色</dt><dd>{{ metadata.usedColors }} 色</dd></div>
@@ -105,7 +80,7 @@
         <footer class="pattern-actions pattern-preview-actions">
           <button class="btn btn-secondary" type="button" :disabled="busy" @click="close">暂不追加</button>
           <button class="btn btn-secondary" type="button" :disabled="busy" @click="$emit('refine')">
-            {{ isRefining ? '等待 Perler 回传…' : '进入 Perler 精修' }}
+            {{ isRefining ? '等待 Perler 回传…' : '在 Perler 中编辑' }}
           </button>
           <button class="btn btn-primary" type="button" :disabled="busy" @click="$emit('append')">
             {{ isAppending ? '追加中…' : '确认追加' }}
@@ -119,26 +94,8 @@
     <div v-if="fullscreenOpen" class="pattern-fullscreen" role="dialog" aria-modal="true" aria-label="拼豆图纸全屏预览">
       <header class="pattern-fullscreen-toolbar">
         <div class="pattern-fullscreen-title">
-          <strong>{{ activePreviewLabel }}</strong>
+          <strong>拼豆图纸</strong>
           <span>{{ fullscreenFit ? '适应窗口' : `${zoomPercent}%` }}</span>
-        </div>
-        <div v-if="hasComparison" class="pattern-version-switch pattern-version-switch-dark" role="group" aria-label="选择全屏预览版本">
-          <button
-            type="button"
-            :class="{ active: activePreview === 'ai' }"
-            :aria-pressed="activePreview === 'ai'"
-            @click="activePreview = 'ai'"
-          >
-            AI 精修版
-          </button>
-          <button
-            type="button"
-            :class="{ active: activePreview === 'base' }"
-            :aria-pressed="activePreview === 'base'"
-            @click="activePreview = 'base'"
-          >
-            104 精细基础版
-          </button>
         </div>
         <div class="pattern-zoom-controls" aria-label="预览缩放控制">
           <button type="button" aria-label="缩小" title="缩小" @click="zoomOut">−</button>
@@ -160,10 +117,10 @@
       <div class="pattern-fullscreen-canvas">
         <div class="pattern-fullscreen-stage" :class="{ fit: fullscreenFit }">
           <img
-            v-if="activePreviewUrl"
-            :key="activePreviewUrl"
-            :src="activePreviewUrl"
-            :alt="`${activePreviewLabel}拼豆图纸全尺寸预览`"
+            v-if="previewUrl"
+            :key="previewUrl"
+            :src="previewUrl"
+            alt="Perler 拼豆图纸全尺寸预览"
             :style="fullscreenImageStyle"
             @load="captureFullscreenImageSize"
           />
@@ -184,32 +141,19 @@ import {
 import type { PerlerPatternMetadata, PerlerProgressUpdate } from '../../integrations/perlerBridge'
 
 type PatternStep = 'config' | 'progress' | 'preview'
-type PatternProgressStage =
-  | PerlerProgressUpdate['stage']
-  | 'ai-source'
-  | 'base-pattern'
-  | 'ai-pattern'
-  | 'final-pattern'
-type PatternProgressUpdate = Omit<PerlerProgressUpdate, 'stage'> & { stage: PatternProgressStage }
+type PatternProgressUpdate = PerlerProgressUpdate
 
-const props = withDefaults(defineProps<{
+const props = defineProps<{
   visible: boolean
   step: PatternStep
   pageNumber: number
   progress: PatternProgressUpdate | null
   previewUrl: string
-  beforePreviewUrl?: string
-  aiEnhanced?: boolean
-  warnings?: string[]
   metadata: PerlerPatternMetadata | null
   errorMessage: string
   isRefining: boolean
   isAppending: boolean
-}>(), {
-  beforePreviewUrl: '',
-  aiEnhanced: false,
-  warnings: () => [],
-})
+}>()
 
 const emit = defineEmits<{
   close: []
@@ -222,21 +166,13 @@ const columns = ref('104')
 const rows = ref('104')
 const maxUsedColors = ref('40')
 const formError = ref('')
-const activePreview = ref<'ai' | 'base'>('ai')
 const fullscreenOpen = ref(false)
 const fullscreenFit = ref(true)
 const zoomPercent = ref(100)
 const fullscreenNaturalSize = ref({ width: 0, height: 0 })
 const busy = computed(() => props.isRefining || props.isAppending)
-const hasComparison = computed(() => Boolean(props.aiEnhanced && props.beforePreviewUrl && props.previewUrl))
-const activePreviewUrl = computed(() => (
-  activePreview.value === 'base' && hasComparison.value ? props.beforePreviewUrl : props.previewUrl
-))
-const activePreviewLabel = computed(() => (
-  activePreview.value === 'base' && hasComparison.value ? '104 精细基础版' : props.aiEnhanced ? 'AI 精修版' : '104 精细基础版'
-))
 
-const stageLabels: Record<PatternProgressStage, string> = {
+const stageLabels: Record<PerlerProgressUpdate['stage'], string> = {
   connect: '正在连接 Perler…',
   prepare: '正在准备原图…',
   sample: '正在采样像素…',
@@ -244,12 +180,8 @@ const stageLabels: Record<PatternProgressStage, string> = {
   map: '正在映射拼豆色号…',
   cleanup: '正在清理零碎色块…',
   background: '正在识别并移除背景…',
+  refine: '正在等待 Perler 处理结果…',
   render: '正在渲染母版图纸…',
-  refine: '正在等待 Perler 精修结果…',
-  'ai-source': '正在使用 AI 整理原素材…',
-  'base-pattern': '正在生成 104 精细基础版…',
-  'ai-pattern': '正在使用 AI 精修拼豆图纸…',
-  'final-pattern': '正在校验并渲染最终图纸…',
 }
 
 const progressLabel = computed(() => stageLabels[props.progress?.stage ?? 'connect'])
@@ -276,17 +208,12 @@ watch(
   () => [props.visible, props.step] as const,
   ([visible, step], previous) => {
     if (visible && step === 'config' && (!previous || !previous[0] || previous[1] !== 'config')) resetForm()
-    if (visible && step === 'preview' && (!previous || !previous[0] || previous[1] !== 'preview')) activePreview.value = 'ai'
     if (!visible || step !== 'preview') closeFullscreen()
   },
   { immediate: true },
 )
 
-watch(hasComparison, (available) => {
-  if (!available) activePreview.value = 'ai'
-})
-
-watch(activePreviewUrl, () => {
+watch(() => props.previewUrl, () => {
   fullscreenNaturalSize.value = { width: 0, height: 0 }
 })
 
@@ -313,7 +240,7 @@ const fullscreenImageStyle = computed(() => {
 })
 
 function openFullscreen() {
-  if (!activePreviewUrl.value) return
+  if (!props.previewUrl) return
   fullscreenFit.value = true
   fullscreenOpen.value = true
 }
@@ -409,12 +336,8 @@ function close() {
 .pattern-progress-track span { display: block; height: 100%; border-radius: inherit; background: var(--primary); transition: width 0.25s ease; }
 .pattern-progress .pattern-actions { width: 100%; }
 .pattern-preview-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-.pattern-version-switch { display: inline-flex; gap: 3px; padding: 3px; border-radius: 9px; background: var(--bg-subtle); }
-.pattern-version-switch button { padding: 7px 11px; border: 0; border-radius: 7px; background: transparent; color: var(--text-sub); cursor: pointer; font: inherit; font-size: 12px; font-weight: 600; }
-.pattern-version-switch button.active { background: var(--bg-card); color: var(--primary); box-shadow: 0 1px 4px rgba(15, 23, 42, 0.12); }
 .pattern-preview-tools { display: flex; align-items: center; gap: 9px; margin-left: auto; }
-.pattern-ai-badge { display: inline-flex; align-items: center; min-height: 26px; padding: 0 9px; border: 1px solid var(--border-color); border-radius: 999px; color: var(--text-sub); font-size: 11px; font-weight: 600; }
-.pattern-ai-badge.enhanced { border-color: color-mix(in srgb, var(--primary) 35%, var(--border-color)); background: color-mix(in srgb, var(--primary) 9%, var(--bg-card)); color: var(--primary); }
+.pattern-engine-badge { display: inline-flex; align-items: center; min-height: 26px; padding: 0 9px; border: 1px solid color-mix(in srgb, var(--primary) 35%, var(--border-color)); border-radius: 999px; background: color-mix(in srgb, var(--primary) 9%, var(--bg-card)); color: var(--primary); font-size: 11px; font-weight: 600; }
 .pattern-fullscreen-trigger { padding: 7px 11px; font-size: 12px; }
 .pattern-preview { position: relative; display: grid; width: 100%; min-height: 320px; max-height: 58vh; padding: 0; place-items: center; overflow: auto; border: 1px solid var(--border-color); border-radius: 10px; outline: none; background: var(--bg-subtle); cursor: zoom-in; }
 .pattern-preview:hover, .pattern-preview:focus-visible { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-fade); }
@@ -422,10 +345,7 @@ function close() {
 .pattern-preview-hint { position: absolute; right: 12px; bottom: 12px; padding: 6px 9px; border-radius: 999px; background: rgba(15, 23, 42, 0.76); color: #fff; font-size: 11px; pointer-events: none; }
 .pattern-preview-empty { color: var(--text-sub); cursor: default; font-size: 13px; }
 .pattern-preview-empty:hover { border-color: var(--border-color); box-shadow: none; }
-.pattern-warnings { margin-top: 14px; padding: 12px 14px; border: 1px solid color-mix(in srgb, #f59e0b 32%, var(--border-color)); border-radius: 9px; background: color-mix(in srgb, #f59e0b 8%, var(--bg-card)); color: var(--text-main); font-size: 12px; line-height: 1.5; }
-.pattern-warnings strong { color: #b45309; }
-.pattern-warnings ul { margin: 6px 0 0; padding-left: 18px; }
-.pattern-warnings li + li { margin-top: 3px; }
+.pattern-preview-caption { margin: 9px 0 0; color: var(--text-sub); font-size: 12px; line-height: 1.5; }
 .pattern-metadata { display: flex; flex-wrap: wrap; gap: 22px; margin: 16px 0 0; }
 .pattern-metadata div { display: flex; align-items: baseline; gap: 7px; }
 .pattern-metadata dt { color: var(--text-sub); font-size: 12px; }
@@ -435,9 +355,6 @@ function close() {
 .pattern-fullscreen-title { display: flex; flex-direction: column; min-width: 125px; gap: 2px; }
 .pattern-fullscreen-title strong { font-size: 13px; }
 .pattern-fullscreen-title span { color: #9ca3af; font-size: 11px; }
-.pattern-version-switch-dark { flex: 0 1 auto; background: rgba(255, 255, 255, 0.1); }
-.pattern-version-switch-dark button { color: #cbd5e1; }
-.pattern-version-switch-dark button.active { background: rgba(255, 255, 255, 0.17); color: #fff; box-shadow: none; }
 .pattern-zoom-controls { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .pattern-zoom-controls button { min-height: 34px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 7px; background: rgba(255, 255, 255, 0.08); color: #fff; cursor: pointer; font: inherit; font-size: 12px; }
 .pattern-zoom-controls button:hover, .pattern-zoom-controls button.active { background: rgba(255, 255, 255, 0.2); }
@@ -453,13 +370,11 @@ function close() {
   .pattern-header, .pattern-body { padding: 18px; }
   .pattern-fields { grid-template-columns: 1fr; }
   .pattern-preview-toolbar { align-items: stretch; flex-direction: column; }
-  .pattern-version-switch { display: grid; grid-template-columns: 1fr 1fr; }
   .pattern-preview-tools { justify-content: space-between; width: 100%; margin-left: 0; }
   .pattern-preview { min-height: 220px; }
   .pattern-preview-actions .btn { width: 100%; }
   .pattern-fullscreen-toolbar { align-items: stretch; flex-wrap: wrap; padding: 9px 10px; }
   .pattern-fullscreen-title { min-width: 0; }
-  .pattern-version-switch-dark { order: 3; width: 100%; }
   .pattern-zoom-controls { flex-wrap: wrap; margin-left: auto; }
   .pattern-zoom-controls input { width: 90px; }
   .pattern-fullscreen-stage { padding: 14px; }

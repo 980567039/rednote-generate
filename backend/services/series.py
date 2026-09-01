@@ -99,6 +99,46 @@ def normalize_content_mode(value: Any) -> str:
     return mode
 
 
+def resolve_content_mode(
+    value: Any = None,
+    template: Optional[Dict[str, Any]] = None,
+    context: str = "",
+) -> str:
+    """解析内容方向，并为早期角色合集数据提供结构化字段缺失兜底。
+
+    新数据会显式保存 ``content_mode``，且显式的 ``story`` 必须优先于
+    旧上下文。早期记录没有该字段时，则根据快照的
+    ``page_structure.preset`` 或冻结上下文中的角色标记恢复角色模式。
+    """
+    if value is not None and str(value).strip():
+        return normalize_content_mode(value)
+    template = template or {}
+    stored = template.get("content_mode")
+    if stored is not None and str(stored).strip():
+        return normalize_content_mode(stored)
+    structure = template.get("page_structure") or {}
+    if structure.get("preset") == "character_sheet":
+        return "character_sheet"
+    if "内容方向：精细角色图" in (context or ""):
+        return "character_sheet"
+    return "story"
+
+
+def frozen_context_matches_mode(context: str, mode: str) -> bool:
+    """判断冻结上下文是否与结构化内容方向一致。
+
+    旧版系列记录可能只保存了人类可读的上下文，没有保存
+    ``content_mode``。当调用方后来显式指定了模式时，不能继续复用相反
+    方向的冻结文本，否则图片/文案提示词会同时收到两套互相冲突的规则。
+    普通故事上下文不一定包含固定的“剧情小故事”字样，因此这里只把
+    角色模式的明确标记作为冲突判据。
+    """
+    if not isinstance(context, str) or not context.strip():
+        return False
+    is_character_context = "内容方向：精细角色图" in context
+    return is_character_context == (normalize_content_mode(mode) == "character_sheet")
+
+
 def extract_character_names(topic: str) -> List[str]:
     """从角色图主题中提取角色名单；没有明确名单时退化为主题本身一个角色。"""
     value = re.sub(r"\s+", " ", str(topic or "")).strip()
@@ -371,7 +411,7 @@ def build_context(
     item_index: Optional[int] = None,
     content_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
-    mode = normalize_content_mode(content_mode or (template or {}).get("content_mode"))
+    mode = resolve_content_mode(content_mode, template)
     if not template:
         return {
             "series_id": None,
@@ -689,8 +729,18 @@ def get_project_item(project: Dict[str, Any], item_id: str) -> Dict[str, Any]:
 
 def update_item(project: Dict[str, Any], item_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     item = get_project_item(project, item_id)
-    requested_mode = normalize_content_mode(payload.get("content_mode", item.get("content_mode", "story")))
-    if requested_mode != item.get("content_mode", "story"):
+    current_mode = resolve_content_mode(
+        item.get("content_mode"),
+        item.get("template_snapshot"),
+        item.get("series_context_snapshot", ""),
+    )
+    requested_mode = (
+        normalize_content_mode(payload.get("content_mode"))
+        if "content_mode" in payload and payload.get("content_mode") is not None
+        and str(payload.get("content_mode")).strip()
+        else current_mode
+    )
+    if requested_mode != current_mode:
         if item.get("record_id") or item.get("status") not in {"draft", "failed"}:
             raise ValueError("已开始生成的子主题不能切换内容方向")
         item["content_mode"] = requested_mode
@@ -725,7 +775,7 @@ def update_item(project: Dict[str, Any], item_id: str, payload: Dict[str, Any]) 
             item["topic_source"] = "user_modified_system" if item.get("topic_source") == "system" else "user"
             snapshot = item.get("template_snapshot") or get_template(project["template_id"])
             item["template_snapshot"] = snapshot
-            if item.get("content_mode") == "character_sheet":
+            if requested_mode == "character_sheet":
                 snapshot = _clone(snapshot)
                 snapshot["page_structure"] = character_page_structure(topic)
                 snapshot["character_names"] = extract_character_names(topic)
@@ -954,6 +1004,17 @@ def series_context_from_payload(payload: Optional[Dict[str, Any]]) -> Dict[str, 
             raise ValueError("系列项目不存在")
         item = get_project_item(project, str(item_id))
         snapshot = item.get("template_snapshot") or get_template(project["template_id"])
+        mode = resolve_content_mode(
+            item.get("content_mode"),
+            snapshot,
+            item.get("series_context_snapshot", ""),
+        )
+        frozen_context = item.get("series_context_snapshot") or ""
+        context = (
+            frozen_context
+            if frozen_context_matches_mode(frozen_context, mode)
+            else build_context(snapshot, item.get("topic", ""), item.get("index"), mode)["series_context"]
+        )
         return {
             "series_id": project["id"],
             "series_project_id": project["id"],
@@ -961,16 +1022,24 @@ def series_context_from_payload(payload: Optional[Dict[str, Any]]) -> Dict[str, 
             "series_template_id": snapshot.get("id") if snapshot else project["template_id"],
             "series_item_index": item.get("index"),
             "series_item_title": item.get("topic"),
-            "content_mode": normalize_content_mode(item.get("content_mode", "story")),
-            "series_context": item.get("series_context_snapshot") or build_context(snapshot, item.get("topic", ""), item.get("index"))["series_context"],
+            "content_mode": mode,
+            # Rebuild legacy items with their explicit mode.  Without this
+            # argument a character-sheet item whose frozen context is absent
+            # would be reconstructed as a story item.
+            "series_context": context,
             "series_template": _clone(snapshot),
         }
     template = get_template(str(template_id)) if template_id else None
+    resolved_mode = resolve_content_mode(
+        payload.get("content_mode"),
+        template,
+        "",
+    )
     context = build_context(
         template,
         payload.get("series_item_title") or payload.get("topic") or "",
         payload.get("series_item_index"),
-        payload.get("content_mode", "story"),
+        resolved_mode,
     )
     context.update({"series_id": project_id, "series_project_id": project_id, "series_item_id": item_id})
     return context

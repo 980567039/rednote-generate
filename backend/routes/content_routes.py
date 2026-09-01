@@ -10,7 +10,13 @@ import logging
 from flask import Blueprint, request, jsonify
 from backend.services.content import get_content_service
 from backend.services.history import get_history_service
-from backend.services.series import build_context, get_template, series_context_from_payload
+from backend.services.series import (
+    build_context,
+    frozen_context_matches_mode,
+    get_template,
+    resolve_content_mode,
+    series_context_from_payload,
+)
 from .utils import (
     api_error_response,
     log_request,
@@ -60,6 +66,19 @@ def create_content_blueprint():
             record = get_history_service().get_record(data.get("record_id")) if data.get("record_id") else None
             snapshot = (record or {}).get("series_template_snapshot")
             if snapshot:
+                stored_context = (record or {}).get("series_context_snapshot") or ""
+                requested_mode = data.get("content_mode")
+                has_requested_mode = requested_mode is not None and str(requested_mode).strip() != ""
+                mode = resolve_content_mode(
+                    requested_mode if has_requested_mode else (record or {}).get("series_content_mode"),
+                    snapshot,
+                    stored_context,
+                )
+                context = (
+                    stored_context
+                    if frozen_context_matches_mode(stored_context, mode)
+                    else build_context(snapshot, topic, record.get("series_item_index"), mode)["series_context"]
+                )
                 series_kwargs.update({
                     "series_id": record.get("series_id"),
                     "series_project_id": record.get("series_project_id") or record.get("series_id"),
@@ -67,8 +86,8 @@ def create_content_blueprint():
                     "series_template_id": snapshot.get("id"),
                     "series_item_index": record.get("series_item_index"),
                     "series_item_title": record.get("series_item_title") or topic,
-                    "content_mode": record.get("series_content_mode", snapshot.get("content_mode", "story")),
-                    "series_context": record.get("series_context_snapshot") or build_context(snapshot, topic, record.get("series_item_index"), record.get("series_content_mode", snapshot.get("content_mode", "story")))["series_context"],
+                    "content_mode": mode,
+                    "series_context": context,
                     "series_template": snapshot,
                 })
             elif data.get("series_project_id") and data.get("series_item_id"):
@@ -76,7 +95,8 @@ def create_content_blueprint():
             else:
                 template = get_template(series_template_id) if series_template_id else None
                 if template:
-                    series_kwargs.update(build_context(template, series_item_title or topic, series_item_index, data.get("content_mode", "story")))
+                    mode = resolve_content_mode(data.get("content_mode"), template)
+                    series_kwargs.update(build_context(template, series_item_title or topic, series_item_index, mode))
 
             log_request('/content', {'topic': topic[:50] if topic else '', 'outline_length': len(outline)})
 
