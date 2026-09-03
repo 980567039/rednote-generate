@@ -110,6 +110,22 @@
               下载
             </span>
           </div>
+          <div v-if="patternAsset(idx, 'beads') || patternAsset(idx, 'ironed')" class="pattern-output-links">
+            <button
+              v-if="patternAsset(idx, 'beads')"
+              type="button"
+              @click="openImagePreview(patternAsset(idx, 'beads'), idx, '拼豆实物效果图')"
+            >
+              查看拼豆实物
+            </button>
+            <button
+              v-if="patternAsset(idx, 'ironed')"
+              type="button"
+              @click="openImagePreview(patternAsset(idx, 'ironed'), idx, '熨烫成品效果图')"
+            >
+              查看熨烫成品
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -132,6 +148,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
+import { getImageUrl } from '../../api'
 import ImagePreviewModal from '../common/ImagePreviewModal.vue'
 import RegenerateImageModal from '../common/RegenerateImageModal.vue'
 
@@ -152,10 +169,14 @@ interface ViewingRecord {
   updated_at: string
   outline: {
     raw: string
-    pages: Array<{ type: string; content: string }>
+    pages: Array<{
+      type: string
+      content: string
+      pattern?: { outputs?: { beads?: string; ironed?: string } }
+    }>
   }
   images: {
-    task_id: string
+    task_id: string | null
     generated: string[]
   }
 }
@@ -182,11 +203,19 @@ const previewImage = ref<{ src: string; alt: string } | null>(null)
 const regenerateIndex = ref<number | null>(null)
 const regenerateSubmitted = ref(false)
 
-function openImagePreview(src: string, index: number) {
+function openImagePreview(src: string, index: number, label = '大图') {
   previewImage.value = {
     src,
-    alt: `第 ${index + 1} 页大图`
+    alt: `第 ${index + 1} 页${label}`
   }
+}
+
+function patternAsset(index: number, kind: 'beads' | 'ironed'): string {
+  const record = props.record
+  const filename = record?.outline.pages[index]?.pattern?.outputs?.[kind]
+  return record?.images.task_id && filename
+    ? getImageUrl(record.images.task_id, filename, false)
+    : ''
 }
 
 function openRegenerateDialog(index: number) {
@@ -491,6 +520,28 @@ const formattedDate = computed(() => {
   justify-content: space-between;
   font-size: 12px;
   color: #666;
+}
+
+.pattern-output-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.pattern-output-links button {
+  padding: 4px 7px;
+  border: 1px solid #e5e7eb;
+  border-radius: 5px;
+  background: #fafafa;
+  color: var(--primary, #ff2442);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.pattern-output-links button:hover {
+  border-color: var(--primary, #ff2442);
+  background: #fff1f2;
 }
 
 .download-link {

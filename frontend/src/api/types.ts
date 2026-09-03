@@ -9,6 +9,11 @@ export interface Page {
     columns: number
     rows: number
     used_colors: number
+    /** Optional visual exports saved alongside the grid master. */
+    outputs?: {
+      beads?: string
+      ironed?: string
+    }
   }
 }
 

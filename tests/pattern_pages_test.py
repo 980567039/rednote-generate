@@ -58,6 +58,52 @@ def test_append_pattern_page_is_atomic_and_idempotent(tmp_path):
     assert (task_dir / record["images"]["generated"][-1]).read_bytes() == png_bytes()
 
 
+def test_append_pattern_page_saves_visual_outputs_without_extra_page(tmp_path):
+    service = make_history_service(tmp_path)
+    record_id = service.create_record(
+        "系列角色",
+        {"pages": [{"index": 0, "type": "cover", "content": "角色"}]},
+        task_id="task_pattern",
+    )
+    task_dir = tmp_path / "task_pattern"
+    task_dir.mkdir()
+    (task_dir / "0.png").write_bytes(png_bytes())
+    service.update_record(record_id, images={"task_id": "task_pattern", "generated": ["0.png"]}, status="completed")
+
+    result = service.append_pattern_image(
+        record_id,
+        "req-effects",
+        png_bytes(),
+        0,
+        104,
+        104,
+        40,
+        beads_data=png_bytes(),
+        ironed_data=png_bytes(),
+    )
+    record = service.get_record(record_id)
+    page = record["outline"]["pages"][-1]
+    outputs = page["pattern"]["outputs"]
+
+    assert result["appended"] is True
+    assert set(outputs) == {"beads", "ironed"}
+    assert len(record["outline"]["pages"]) == 2
+    assert len(record["images"]["generated"]) == 2
+    assert all((task_dir / filename).is_file() for filename in outputs.values())
+
+    duplicate = service.append_pattern_image(
+        record_id,
+        "req-effects",
+        b"invalid",
+        0,
+        104,
+        104,
+        40,
+    )
+    assert duplicate["appended"] is False
+    assert duplicate["outputs"] == outputs
+
+
 def test_append_pattern_page_rejects_inconsistent_history(tmp_path):
     service = make_history_service(tmp_path)
     record_id = service.create_record(
@@ -133,6 +179,8 @@ def test_pattern_page_route_requires_explicit_upload_and_is_idempotent(tmp_path,
             "rows": "104",
             "used_colors": "40",
             "pattern": (io.BytesIO(png_bytes()), "master.png"),
+            "beads": (io.BytesIO(png_bytes()), "beads.png"),
+            "ironed": (io.BytesIO(png_bytes()), "ironed.png"),
         },
         content_type="multipart/form-data",
     )
@@ -147,5 +195,6 @@ def test_pattern_page_route_requires_explicit_upload_and_is_idempotent(tmp_path,
 
     assert response.status_code == 200
     assert response.get_json()["appended"] is True
+    assert set(response.get_json()["outputs"]) == {"beads", "ironed"}
     assert duplicate.status_code == 200
     assert duplicate.get_json()["appended"] is False

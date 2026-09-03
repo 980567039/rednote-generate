@@ -116,12 +116,18 @@ export async function appendPatternPage(
     rows: number
     usedColors: number
     pattern: Blob
+    beads?: Blob
+    ironed?: Blob
   }
 ): Promise<{
   success: boolean
   appended?: boolean
   page_index?: number
   filename?: string
+  outputs?: {
+    beads?: string
+    ironed?: string
+  }
   record?: HistoryDetail
   error?: AppError | string
   error_message?: string
@@ -133,6 +139,8 @@ export async function appendPatternPage(
   formData.append('rows', String(input.rows))
   formData.append('used_colors', String(input.usedColors))
   formData.append('pattern', input.pattern, 'perler-master.png')
+  if (input.beads) formData.append('beads', input.beads, 'perler-beads.png')
+  if (input.ironed) formData.append('ironed', input.ironed, 'perler-ironed.png')
   try {
     const response = await axios.post(
       `${API_BASE_URL}/history/${encodeURIComponent(recordId)}/pattern-pages`,

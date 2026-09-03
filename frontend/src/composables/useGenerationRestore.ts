@@ -48,9 +48,16 @@ export function useGenerationRestore() {
     const images: GeneratedImage[] = pages.map((page, idx) => {
       const filename = generated[page.index] || generated[idx] || ''
       const imageError = record.images.errors?.[String(page.index)] ?? record.images.errors?.[String(idx)]
+      const outputs = page.pattern?.outputs
       return {
         index: page.index,
         url: filename && taskId ? getImageUrl(taskId, filename) : '',
+        ...(taskId && outputs ? {
+          patternAssets: {
+            ...(outputs.beads ? { beads: getImageUrl(taskId, outputs.beads, false) } : {}),
+            ...(outputs.ironed ? { ironed: getImageUrl(taskId, outputs.ironed, false) } : {}),
+          },
+        } : {}),
         status: filename ? 'done' : 'error',
         error: filename ? undefined : (imageError ? formatErrorMessage(imageError, '图片生成失败') : '原始失败原因未保存，点击补全后会显示新的实时错误。'),
         retryable: !filename

@@ -327,6 +327,18 @@ def create_history_blueprint():
                     context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id},
                 )
 
+            def read_optional_file(field_name, label, max_bytes):
+                upload = request.files.get(field_name)
+                if not upload or not upload.filename:
+                    return None
+                data = upload.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    raise ValueError(f"{label}文件超过 {max_bytes // (1024 * 1024)}MB")
+                return data
+
+            beads_data = read_optional_file('beads', '拼豆实物效果图', 10 * 1024 * 1024)
+            ironed_data = read_optional_file('ironed', '熨烫成品效果图', 10 * 1024 * 1024)
+
             def form_int(name, default):
                 raw = request.form.get(name)
                 return default if raw in (None, '') else int(raw)
@@ -339,14 +351,19 @@ def create_history_blueprint():
                 columns=form_int('columns', 104),
                 rows=form_int('rows', 104),
                 used_colors=form_int('used_colors', 40),
+                beads_data=beads_data,
+                ironed_data=ironed_data,
             )
-            return jsonify({
+            response_payload = {
                 "success": True,
                 "appended": result["appended"],
                 "page_index": result["page_index"],
                 "filename": result["filename"],
                 "record": result["record"],
-            }), 200
+            }
+            if result.get("outputs"):
+                response_payload["outputs"] = result["outputs"]
+            return jsonify(response_payload), 200
         except (TypeError, ValueError) as exc:
             return api_error_response(
                 validation_error(str(exc), "拼豆图纸参数或文件无效。"),

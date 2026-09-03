@@ -22,6 +22,11 @@ import type { Page, SeriesRequestContext } from '../api'
 export interface GeneratedImage {
   index: number  // 图片对应的页面索引
   url: string    // 图片URL
+  /** 附加的拼豆视觉输出（仅 pattern 页面存在）。 */
+  patternAssets?: {
+    beads?: string
+    ironed?: string
+  }
   status: 'queued' | 'generating' | 'done' | 'error' | 'retrying' | 'interrupted'  // 生成状态
   error?: string      // 错误信息
   retryable?: boolean // 是否可以重试
@@ -496,7 +501,11 @@ export const useGeneratorStore = defineStore('generator', {
       }
     },
 
-    appendPatternImage(page: Page, filename: string) {
+    appendPatternImage(
+      page: Page,
+      filename: string,
+      outputs: { beads?: string; ironed?: string } = {},
+    ) {
       if (!this.taskId || this.outline.pages.some(existing => existing.index === page.index)) return
       this.outline.pages.push(page)
       this.outline.pages.sort((first, second) => first.index - second.index)
@@ -504,6 +513,12 @@ export const useGeneratorStore = defineStore('generator', {
       this.images.push({
         index: page.index,
         url: `/api/images/${this.taskId}/${filename}?t=${Date.now()}`,
+        ...(outputs.beads || outputs.ironed ? {
+          patternAssets: {
+            ...(outputs.beads ? { beads: `/api/images/${this.taskId}/${outputs.beads}?t=${Date.now()}` } : {}),
+            ...(outputs.ironed ? { ironed: `/api/images/${this.taskId}/${outputs.ironed}?t=${Date.now()}` } : {}),
+          },
+        } : {}),
         status: 'done'
       })
       this.images.sort((first, second) => first.index - second.index)

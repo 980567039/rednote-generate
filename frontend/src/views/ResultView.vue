@@ -138,6 +138,22 @@
                 {{ patternGeneratingIndex === image.index ? '生成中…' : '拼豆图纸' }}
               </button>
               <button
+                v-if="image.patternAssets?.beads"
+                style="border: none; background: none; color: var(--primary); cursor: pointer; font-size: 12px;"
+                type="button"
+                @click="viewPatternAsset(image.patternAssets.beads, image.index, '拼豆实物效果图')"
+              >
+                拼豆实物
+              </button>
+              <button
+                v-if="image.patternAssets?.ironed"
+                style="border: none; background: none; color: var(--primary); cursor: pointer; font-size: 12px;"
+                type="button"
+                @click="viewPatternAsset(image.patternAssets.ironed, image.index, '熨烫成品效果图')"
+              >
+                熨烫成品
+              </button>
+              <button
                 style="border: none; background: none; color: var(--primary); cursor: pointer; font-size: 12px;"
                 @click="downloadOne(image)"
               >
@@ -179,7 +195,7 @@
       :step="patternModalStep"
       :page-number="(patternTarget?.index ?? 0) + 1"
       :progress="patternProgress"
-      :preview-url="patternPreviewUrl"
+      :preview-urls="patternPreviewUrls"
       :metadata="patternPending?.result.metadata ?? null"
       :error-message="patternErrorMessage"
       :is-refining="isRefiningPattern"
@@ -312,7 +328,11 @@ const patternPending = ref<{
 const patternTarget = ref<{ index: number; url: string } | null>(null)
 const patternModalStep = ref<'config' | 'progress' | 'preview'>('config')
 const patternProgress = ref<PerlerProgressUpdate | null>(null)
-const patternPreviewUrl = ref('')
+const patternPreviewUrls = ref<{
+  pattern?: string
+  beads?: string
+  ironed?: string
+}>({})
 const patternErrorMessage = ref('')
 const patternSettings = ref<PerlerPatternSettings>({ ...DEFAULT_PERLER_SETTINGS })
 const activeAutoPatternJob = shallowRef<PerlerAutoJob | null>(null)
@@ -355,6 +375,13 @@ const viewImage = (url: string) => {
   previewImage.value = {
     src: url,
     alt: image ? `第 ${image.index + 1} 页大图` : '图片大图预览'
+  }
+}
+
+function viewPatternAsset(url: string, index: number, label: string) {
+  previewImage.value = {
+    src: url,
+    alt: `第 ${index + 1} 页${label}`,
   }
 }
 
@@ -407,16 +434,22 @@ const generatePattern = (image: { index: number; url: string }) => {
 }
 
 function revokePatternPreview() {
-  if (patternPreviewUrl.value) URL.revokeObjectURL(patternPreviewUrl.value)
-  patternPreviewUrl.value = ''
+  Object.values(patternPreviewUrls.value).forEach(url => {
+    if (url) URL.revokeObjectURL(url)
+  })
+  patternPreviewUrls.value = {}
 }
 
 function setPatternPreview(result: PerlerPatternResult) {
   revokePatternPreview()
-  // Perler returns two deliberate representations: `preview` is the clean,
-  // no-grid bead rendering for visual review, while `pattern` is the
-  // construction master that must be persisted after confirmation.
-  patternPreviewUrl.value = URL.createObjectURL(result.preview ?? result.pattern)
+  // The three representations share one deterministic grid conversion. The
+  // bead rendering is preferred for the first preview, while the grid master
+  // remains the persisted construction image.
+  patternPreviewUrls.value = {
+    pattern: URL.createObjectURL(result.pattern),
+    ...(result.beads || result.preview ? { beads: URL.createObjectURL(result.beads ?? result.preview!) } : {}),
+    ...(result.ironed ? { ironed: URL.createObjectURL(result.ironed) } : {}),
+  }
 }
 
 function isCancelledPatternReason(reason: unknown): boolean {
@@ -541,7 +574,9 @@ const confirmPatternAppend = async () => {
       columns: pending.result.metadata.columns,
       rows: pending.result.metadata.rows,
       usedColors: pending.result.metadata.usedColors,
-      pattern: pending.result.pattern
+      pattern: pending.result.pattern,
+      beads: pending.result.beads ?? pending.result.preview,
+      ironed: pending.result.ironed,
     })
     if (!response.success || !response.filename || !response.record?.outline.pages) {
       error.value = normalizeApiError(response.error || response.error_message || '服务器未确认追加', '追加拼豆图纸失败')
@@ -552,7 +587,7 @@ const confirmPatternAppend = async () => {
       error.value = normalizeApiError('服务器返回的图纸页面无效', '追加拼豆图纸失败')
       return
     }
-    store.appendPatternImage(page, response.filename)
+    store.appendPatternImage(page, response.filename, response.outputs || page.pattern?.outputs || {})
     error.value = null
     patternPending.value = null
     patternTarget.value = null

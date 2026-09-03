@@ -33,6 +33,11 @@ export interface PerlerPatternMetadata {
 export interface PerlerPatternResult {
   requestId: string
   pattern: Blob
+  /** Cylindrical, un-ironed bead rendering. */
+  beads?: Blob
+  /** Flattened, heat-pressed rendering. */
+  ironed?: Blob
+  /** Legacy alias for the bead rendering returned by older Perler builds. */
   preview?: Blob
   metadata: PerlerPatternMetadata
 }
@@ -67,6 +72,10 @@ interface PerlerMessage {
   requestId?: string
   pattern?: ArrayBuffer
   mimeType?: string
+  beads?: ArrayBuffer
+  beadsMimeType?: string
+  ironed?: ArrayBuffer
+  ironedMimeType?: string
   preview?: ArrayBuffer
   previewMimeType?: string
   metadata?: PerlerPatternMetadata
@@ -177,7 +186,12 @@ async function fetchSourceImage(imageUrl: string, signal?: AbortSignal): Promise
   return { bytes, mimeType }
 }
 
-function patternResultFromMessage(message: PerlerMessage, requestId: string, requirePreview = false): PerlerPatternResult {
+function patternResultFromMessage(
+  message: PerlerMessage,
+  requestId: string,
+  requirePreview = false,
+  requireEffects = false,
+): PerlerPatternResult {
   if (
     message.mimeType !== 'image/png'
     || !(message.pattern instanceof ArrayBuffer)
@@ -185,17 +199,34 @@ function patternResultFromMessage(message: PerlerMessage, requestId: string, req
     || message.pattern.byteLength > MAX_PATTERN_BYTES
   ) throw new Error('Perler 回传的图纸不是有效 PNG，或文件超过 20MB。')
   if (!validMetadata(message.metadata)) throw new Error('Perler 回传的图纸元数据无效。')
-  const preview = message.previewMimeType === 'image/png'
+  const beads = message.beadsMimeType === 'image/png'
+    && message.beads instanceof ArrayBuffer
+    && message.beads.byteLength > 0
+    && message.beads.byteLength <= MAX_PREVIEW_BYTES
+    ? new Blob([message.beads], { type: 'image/png' })
+    : undefined
+  const legacyPreview = message.previewMimeType === 'image/png'
     && message.preview instanceof ArrayBuffer
     && message.preview.byteLength > 0
     && message.preview.byteLength <= MAX_PREVIEW_BYTES
     ? new Blob([message.preview], { type: 'image/png' })
     : undefined
-  if (requirePreview && !preview) throw new Error('Perler 未回传有效的无网格效果预览。')
+  const beadPreview = beads ?? legacyPreview
+  const ironed = message.ironedMimeType === 'image/png'
+    && message.ironed instanceof ArrayBuffer
+    && message.ironed.byteLength > 0
+    && message.ironed.byteLength <= MAX_PREVIEW_BYTES
+    ? new Blob([message.ironed], { type: 'image/png' })
+    : undefined
+  if (requirePreview && !beadPreview) throw new Error('Perler 未回传有效的拼豆实物效果图。')
+  if (requireEffects && (!beadPreview || !ironed)) {
+    throw new Error('Perler 未回传完整的拼豆实物和熨烫成品效果图。')
+  }
   return {
     requestId,
     pattern: new Blob([message.pattern], { type: 'image/png' }),
-    ...(preview ? { preview } : {}),
+    ...(beadPreview ? { beads: beadPreview, preview: beadPreview } : {}),
+    ...(ironed ? { ironed } : {}),
     metadata: message.metadata,
   }
 }
@@ -338,6 +369,7 @@ export function generatePatternAutomatically(input: {
   const result = new Promise<PerlerPatternResult>((resolve, reject) => {
     let settled = false
     let ready = false
+    let iframeLoaded = false
     let sent = false
     let sourceBytes: ArrayBuffer | null = null
     let sourceMimeType = 'image/png'
@@ -346,6 +378,8 @@ export function generatePatternAutomatically(input: {
 
     const cleanup = () => {
       window.removeEventListener('message', onMessage)
+      iframe.removeEventListener('load', onLoad)
+      iframe.removeEventListener('error', onLoadError)
       window.clearTimeout(connectionTimeout)
       window.clearTimeout(totalTimeout)
       abortController.abort()
@@ -438,17 +472,30 @@ export function generatePatternAutomatically(input: {
       }
       if (message.type !== 'AUTO_PATTERN_READY') return
       try {
-        finishSuccess(patternResultFromMessage(message, requestId, true))
+        finishSuccess(patternResultFromMessage(message, requestId, true, message.protocolVersion === 2))
       } catch (reason) {
         finishError(reason)
       }
     }
 
+    const onLoad = () => {
+      iframeLoaded = true
+    }
+    const onLoadError = () => {
+      finishError(new Error(`Perler 页面无法加载（${origin}），请确认服务已启动且地址配置正确。`))
+    }
+
     cancel = () => finishError(new PerlerBridgeCancelledError())
     window.addEventListener('message', onMessage)
+    iframe.addEventListener('load', onLoad)
+    iframe.addEventListener('error', onLoadError)
     iframe.src = perlerUrl.toString()
     connectionTimeout = window.setTimeout(
-      () => finishError(new Error('连接 Perler 超时，请确认 Perler 已启动且允许 RedInk 嵌入。')),
+      () => finishError(new Error(
+        iframeLoaded
+          ? `Perler 页面已加载但没有完成 RedInk 握手，请检查 Perler 的 VITE_REDINK_ORIGIN 与 CSP frame-ancestors 配置（${origin}）。`
+          : `连接 Perler 超时，未能访问 ${origin}。请先启动 Perler to Perfect，并确认地址与 VITE_PERLER_ORIGIN 一致。`,
+      )),
       CONNECTION_TIMEOUT_MS,
     )
     totalTimeout = window.setTimeout(

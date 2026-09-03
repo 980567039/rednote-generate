@@ -580,8 +580,16 @@ class HistoryService:
         columns: int,
         rows: int,
         used_colors: int,
+        beads_data: Optional[bytes] = None,
+        ironed_data: Optional[bytes] = None,
     ) -> Dict[str, Any]:
-        """幂等地把 Perler 母版追加为历史记录的最后一页。"""
+        """幂等地把 Perler 母版和可选效果图追加为历史记录的最后一页。
+
+        ``pattern`` 是页面主图，``beads`` 和 ``ironed`` 只是该页面的
+        附属输出，因此不会写入 ``images.generated``，也不会改变页面索引。
+        旧客户端只上传 ``pattern`` 时仍按原协议工作；同一个 request_id
+        后续补交效果图时，会在已有页面上幂等地补齐缺失资源。
+        """
         with self._ensure_lock():
             record = self.get_record(record_id)
             if not record:
@@ -590,12 +598,21 @@ class HistoryService:
             images = dict(record.get("images") or {})
             pattern_requests = dict(images.get("pattern_requests") or {})
             existing = pattern_requests.get(request_id)
-            if isinstance(existing, dict) and existing.get("filename"):
+
+            # 兼容旧客户端的重试：没有附属文件时不再读取/校验无关的
+            # pattern 内容。若后续带来了效果图，则继续向下补齐缺失输出。
+            if (
+                isinstance(existing, dict)
+                and existing.get("filename")
+                and beads_data is None
+                and ironed_data is None
+            ):
                 return {
                     "record": record,
                     "appended": False,
                     "page_index": existing.get("page_index"),
                     "filename": existing["filename"],
+                    "outputs": dict(existing.get("outputs") or {}),
                 }
 
             if not image_data or len(image_data) > 20 * 1024 * 1024:
@@ -609,19 +626,29 @@ class HistoryService:
             if not isinstance(source_image_index, int) or source_image_index < 0:
                 raise ValueError("来源图片索引无效")
 
-            try:
-                with Image.open(io.BytesIO(image_data)) as image:
-                    if image.format != "PNG":
-                        raise ValueError("只允许追加 PNG 拼豆母版")
-                    image.verify()
-                with Image.open(io.BytesIO(image_data)) as image:
-                    image.load()
-                    if image.width * image.height > 64_000_000:
-                        raise ValueError("拼豆图纸像素面积超过安全上限")
-            except ValueError:
-                raise
-            except Exception as exc:
-                raise ValueError("拼豆图纸不是有效的 PNG 文件") from exc
+            def validate_png(data: Optional[bytes], label: str, max_bytes: int) -> None:
+                if data is None:
+                    return
+                if not data or len(data) > max_bytes:
+                    raise ValueError(f"{label}文件为空或超过 {max_bytes // (1024 * 1024)}MB")
+                try:
+                    with Image.open(io.BytesIO(data)) as image:
+                        if image.format != "PNG":
+                            raise ValueError(f"只允许追加 PNG {label}")
+                        if image.width * image.height > 64_000_000:
+                            raise ValueError(f"{label}像素面积超过安全上限")
+                        image.verify()
+                    with Image.open(io.BytesIO(data)) as image:
+                        image.load()
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    raise ValueError(f"{label}不是有效的 PNG 文件") from exc
+
+            # 保留旧接口对母版的错误文案，避免旧客户端/测试依赖其语义。
+            validate_png(image_data, "拼豆母版", 20 * 1024 * 1024)
+            validate_png(beads_data, "拼豆实物效果图", 10 * 1024 * 1024)
+            validate_png(ironed_data, "熨烫成品效果图", 10 * 1024 * 1024)
 
             task_id = images.get("task_id")
             if not isinstance(task_id, str) or not task_id or os.path.basename(task_id) != task_id:
@@ -631,9 +658,72 @@ class HistoryService:
             if os.path.commonpath([history_root, task_dir]) != history_root or not os.path.isdir(task_dir):
                 raise ValueError("历史记录图片目录不存在")
 
+            def save_asset(data: bytes, prefix: str) -> str:
+                filename = f"{prefix}_{uuid.uuid4().hex}.png"
+                temporary_path = None
+                try:
+                    fd, temporary_path = tempfile.mkstemp(prefix=f".{prefix}-", suffix=".png", dir=task_dir)
+                    with os.fdopen(fd, "wb") as image_file:
+                        image_file.write(data)
+                        image_file.flush()
+                        os.fsync(image_file.fileno())
+                    os.replace(temporary_path, os.path.join(task_dir, filename))
+                    temporary_path = None
+                finally:
+                    if temporary_path:
+                        try:
+                            os.unlink(temporary_path)
+                        except FileNotFoundError:
+                            pass
+                return filename
+
             outline = dict(record.get("outline") or {})
             pages = list(outline.get("pages") or [])
             generated = list(images.get("generated") or [])
+            if isinstance(existing, dict) and existing.get("filename"):
+                page_index = existing.get("page_index")
+                if not isinstance(page_index, int) or page_index < 0 or page_index >= len(pages):
+                    raise ValueError("历史记录中的拼豆页面索引无效")
+                page = pages[page_index]
+                if not isinstance(page, dict) or page.get("type") != "pattern":
+                    raise ValueError("历史记录中的拼豆页面无效")
+                raw_pattern_meta = page.get("pattern")
+                pattern_meta = dict(raw_pattern_meta) if isinstance(raw_pattern_meta, dict) else {}
+                outputs = dict(pattern_meta.get("outputs") or {})
+                # 只补齐缺失的资源，避免同一 request_id 重试产生孤儿文件。
+                outputs_changed = False
+                if beads_data is not None and not outputs.get("beads"):
+                    outputs["beads"] = save_asset(beads_data, "pattern_beads")
+                    outputs_changed = True
+                if ironed_data is not None and not outputs.get("ironed"):
+                    outputs["ironed"] = save_asset(ironed_data, "pattern_ironed")
+                    outputs_changed = True
+                if outputs_changed:
+                    pattern_meta["outputs"] = outputs
+                    page["pattern"] = pattern_meta
+                    pages[page_index] = page
+                    outline["pages"] = pages
+                    record["outline"] = outline
+                    existing = {**existing, "outputs": outputs}
+                    pattern_requests[request_id] = existing
+                    images["pattern_requests"] = pattern_requests
+                    record["images"] = images
+                    record["updated_at"] = datetime.now().isoformat()
+                    self._atomic_write_json(self._get_record_path(record_id), record)
+                    index = self._load_index()
+                    for index_record in index.get("records", []):
+                        if index_record.get("id") == record_id:
+                            index_record["updated_at"] = record["updated_at"]
+                            break
+                    self._save_index(index)
+                return {
+                    "record": record,
+                    "appended": False,
+                    "page_index": page_index,
+                    "filename": existing["filename"],
+                    "outputs": outputs,
+                }
+
             if len(generated) != len(pages):
                 raise ValueError("历史记录页面和图片数量不一致，请先同步历史记录")
             source_page = pages[source_image_index] if source_image_index < len(pages) else None
@@ -641,22 +731,12 @@ class HistoryService:
                 raise ValueError("来源图片索引必须指向已有的原始图片页面")
 
             page_index = len(pages)
-            filename = f"pattern_{uuid.uuid4().hex}.png"
-            temporary_path = None
-            try:
-                fd, temporary_path = tempfile.mkstemp(prefix=".pattern-", suffix=".png", dir=task_dir)
-                with os.fdopen(fd, "wb") as image_file:
-                    image_file.write(image_data)
-                    image_file.flush()
-                    os.fsync(image_file.fileno())
-                os.replace(temporary_path, os.path.join(task_dir, filename))
-                temporary_path = None
-            finally:
-                if temporary_path:
-                    try:
-                        os.unlink(temporary_path)
-                    except FileNotFoundError:
-                        pass
+            filename = save_asset(image_data, "pattern")
+            outputs: Dict[str, str] = {}
+            if beads_data is not None:
+                outputs["beads"] = save_asset(beads_data, "pattern_beads")
+            if ironed_data is not None:
+                outputs["ironed"] = save_asset(ironed_data, "pattern_ironed")
 
             page = {
                 "index": page_index,
@@ -670,6 +750,7 @@ class HistoryService:
                     "columns": columns,
                     "rows": rows,
                     "used_colors": used_colors,
+                    **({"outputs": outputs} if outputs else {}),
                 },
             }
             pages.append(page)
@@ -682,7 +763,11 @@ class HistoryService:
             images["generated"] = generated
             images["pattern_requests"] = {
                 **pattern_requests,
-                request_id: {"filename": filename, "page_index": page_index},
+                request_id: {
+                    "filename": filename,
+                    "page_index": page_index,
+                    **({"outputs": outputs} if outputs else {}),
+                },
             }
             record["outline"] = outline
             record["images"] = images
@@ -704,6 +789,7 @@ class HistoryService:
                 "appended": True,
                 "page_index": page_index,
                 "filename": filename,
+                "outputs": outputs,
             }
 
     def sync_record_images(self, record_id: str, record: Optional[Dict] = None) -> Dict[str, Any]:

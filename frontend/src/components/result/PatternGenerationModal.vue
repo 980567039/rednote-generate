@@ -3,10 +3,10 @@
     <section class="pattern-dialog" role="dialog" aria-modal="true" aria-labelledby="pattern-dialog-title">
       <header class="pattern-header">
         <div>
-          <h2 id="pattern-dialog-title">生成第 {{ pageNumber }} 页的拼豆图纸</h2>
+          <h2 id="pattern-dialog-title">生成第 {{ pageNumber }} 页的拼豆图纸和效果图</h2>
           <p v-if="step === 'config'">输入成品网格规格，Perler 将在后台自动生成。</p>
           <p v-else-if="step === 'progress'">正在后台处理原图，请保持当前页面打开。</p>
-          <p v-else>图纸尚未写入历史记录，确认后才会追加到最后一页。</p>
+          <p v-else>确认后会保存方格图纸、拼豆实物和熨烫成品，并追加到最后一页。</p>
         </div>
         <button class="pattern-close" type="button" :disabled="busy" aria-label="关闭" @click="close">×</button>
       </header>
@@ -52,27 +52,41 @@
       <div v-else class="pattern-body">
         <p v-if="errorMessage" class="pattern-error" role="alert">{{ errorMessage }}</p>
         <div class="pattern-preview-toolbar">
+          <div class="pattern-preview-tabs" role="tablist" aria-label="拼豆输出类型">
+            <button
+              v-for="tab in previewTabs"
+              :key="tab.key"
+              class="pattern-preview-tab"
+              :class="{ active: selectedPreview === tab.key }"
+              type="button"
+              role="tab"
+              :aria-selected="selectedPreview === tab.key"
+              @click="selectedPreview = tab.key"
+            >
+              {{ tab.label }}
+            </button>
+          </div>
           <div class="pattern-preview-tools">
-            <span class="pattern-engine-badge">Perler 图纸预览</span>
-            <button class="btn btn-secondary pattern-fullscreen-trigger" type="button" :disabled="!previewUrl" @click="openFullscreen">
+            <span class="pattern-engine-badge">{{ activePreviewLabel }}</span>
+            <button class="btn btn-secondary pattern-fullscreen-trigger" type="button" :disabled="!activePreviewUrl" @click="openFullscreen">
               全屏查看
             </button>
           </div>
         </div>
         <button
-          v-if="previewUrl"
+          v-if="activePreviewUrl"
           class="pattern-preview"
           type="button"
-          aria-label="全屏查看拼豆图纸"
+          :aria-label="`全屏查看${activePreviewLabel}`"
           @click="openFullscreen"
         >
-          <img :src="previewUrl" alt="Perler 拼豆图纸预览" />
+          <img :src="activePreviewUrl" :alt="`Perler ${activePreviewLabel}`" />
           <span class="pattern-preview-hint">点击查看原始尺寸</span>
         </button>
         <div v-else class="pattern-preview pattern-preview-empty">
           暂无可预览的图纸
         </div>
-        <p v-if="previewUrl" class="pattern-preview-caption">自动结果优先展示无网格效果预览；确认追加后始终保存可施工的母版图纸。</p>
+        <p v-if="activePreviewUrl" class="pattern-preview-caption">三种图片来自同一份拼豆网格：方格图纸用于施工，另外两种用于预览制作前后的效果。</p>
         <dl v-if="metadata" class="pattern-metadata">
           <div><dt>实际规格</dt><dd>{{ metadata.columns }} × {{ metadata.rows }}</dd></div>
           <div><dt>实际用色</dt><dd>{{ metadata.usedColors }} 色</dd></div>
@@ -91,10 +105,10 @@
   </div>
 
   <Teleport to="body">
-    <div v-if="fullscreenOpen" class="pattern-fullscreen" role="dialog" aria-modal="true" aria-label="拼豆图纸全屏预览">
+    <div v-if="fullscreenOpen" class="pattern-fullscreen" role="dialog" aria-modal="true" :aria-label="`全屏查看${activePreviewLabel}`">
       <header class="pattern-fullscreen-toolbar">
         <div class="pattern-fullscreen-title">
-          <strong>拼豆图纸</strong>
+          <strong>{{ activePreviewLabel }}</strong>
           <span>{{ fullscreenFit ? '适应窗口' : `${zoomPercent}%` }}</span>
         </div>
         <div class="pattern-zoom-controls" aria-label="预览缩放控制">
@@ -117,10 +131,10 @@
       <div class="pattern-fullscreen-canvas">
         <div class="pattern-fullscreen-stage" :class="{ fit: fullscreenFit }">
           <img
-            v-if="previewUrl"
-            :key="previewUrl"
-            :src="previewUrl"
-            alt="Perler 拼豆图纸全尺寸预览"
+            v-if="activePreviewUrl"
+            :key="activePreviewUrl"
+            :src="activePreviewUrl"
+            :alt="`Perler ${activePreviewLabel}全尺寸预览`"
             :style="fullscreenImageStyle"
             @load="captureFullscreenImageSize"
           />
@@ -142,13 +156,14 @@ import type { PerlerPatternMetadata, PerlerProgressUpdate } from '../../integrat
 
 type PatternStep = 'config' | 'progress' | 'preview'
 type PatternProgressUpdate = PerlerProgressUpdate
+type PatternPreviewKind = 'pattern' | 'beads' | 'ironed'
 
 const props = defineProps<{
   visible: boolean
   step: PatternStep
   pageNumber: number
   progress: PatternProgressUpdate | null
-  previewUrl: string
+  previewUrls: Partial<Record<PatternPreviewKind, string>>
   metadata: PerlerPatternMetadata | null
   errorMessage: string
   isRefining: boolean
@@ -170,7 +185,28 @@ const fullscreenOpen = ref(false)
 const fullscreenFit = ref(true)
 const zoomPercent = ref(100)
 const fullscreenNaturalSize = ref({ width: 0, height: 0 })
+const selectedPreview = ref<PatternPreviewKind>('beads')
 const busy = computed(() => props.isRefining || props.isAppending)
+
+const previewTabLabels: Record<PatternPreviewKind, string> = {
+  pattern: '方格图纸',
+  beads: '拼豆实物',
+  ironed: '熨烫成品',
+}
+const previewTabs = computed(() => (
+  (Object.keys(previewTabLabels) as PatternPreviewKind[])
+    .filter(key => Boolean(props.previewUrls[key]))
+    .map(key => ({ key, label: previewTabLabels[key] }))
+))
+const activePreviewUrl = computed(() => props.previewUrls[selectedPreview.value] || '')
+const activePreviewLabel = computed(() => previewTabLabels[selectedPreview.value])
+
+function syncSelectedPreview() {
+  if (props.previewUrls[selectedPreview.value]) return
+  const fallback = (['beads', 'pattern', 'ironed'] as PatternPreviewKind[])
+    .find(key => Boolean(props.previewUrls[key]))
+  if (fallback) selectedPreview.value = fallback
+}
 
 const stageLabels: Record<PerlerProgressUpdate['stage'], string> = {
   connect: '正在连接 Perler…',
@@ -181,7 +217,7 @@ const stageLabels: Record<PerlerProgressUpdate['stage'], string> = {
   cleanup: '正在清理零碎色块…',
   background: '正在识别并移除背景…',
   refine: '正在等待 Perler 处理结果…',
-  render: '正在渲染母版图纸…',
+  render: '正在渲染三种拼豆输出…',
 }
 
 const progressLabel = computed(() => stageLabels[props.progress?.stage ?? 'connect'])
@@ -208,14 +244,16 @@ watch(
   () => [props.visible, props.step] as const,
   ([visible, step], previous) => {
     if (visible && step === 'config' && (!previous || !previous[0] || previous[1] !== 'config')) resetForm()
+    if (visible && step === 'preview') syncSelectedPreview()
     if (!visible || step !== 'preview') closeFullscreen()
   },
   { immediate: true },
 )
 
-watch(() => props.previewUrl, () => {
+watch(() => props.previewUrls, () => {
   fullscreenNaturalSize.value = { width: 0, height: 0 }
-})
+  syncSelectedPreview()
+}, { deep: true })
 
 const fullscreenImageStyle = computed(() => {
   if (fullscreenFit.value) {
@@ -240,7 +278,7 @@ const fullscreenImageStyle = computed(() => {
 })
 
 function openFullscreen() {
-  if (!props.previewUrl) return
+  if (!activePreviewUrl.value) return
   fullscreenFit.value = true
   fullscreenOpen.value = true
 }
@@ -336,6 +374,9 @@ function close() {
 .pattern-progress-track span { display: block; height: 100%; border-radius: inherit; background: var(--primary); transition: width 0.25s ease; }
 .pattern-progress .pattern-actions { width: 100%; }
 .pattern-preview-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.pattern-preview-tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.pattern-preview-tab { min-height: 30px; padding: 0 11px; border: 1px solid var(--border-color); border-radius: 7px; background: var(--bg-control); color: var(--text-sub); cursor: pointer; font: inherit; font-size: 12px; }
+.pattern-preview-tab:hover, .pattern-preview-tab.active { border-color: var(--primary); background: var(--primary-fade); color: var(--primary); }
 .pattern-preview-tools { display: flex; align-items: center; gap: 9px; margin-left: auto; }
 .pattern-engine-badge { display: inline-flex; align-items: center; min-height: 26px; padding: 0 9px; border: 1px solid color-mix(in srgb, var(--primary) 35%, var(--border-color)); border-radius: 999px; background: color-mix(in srgb, var(--primary) 9%, var(--bg-card)); color: var(--primary); font-size: 11px; font-weight: 600; }
 .pattern-fullscreen-trigger { padding: 7px 11px; font-size: 12px; }
@@ -370,6 +411,7 @@ function close() {
   .pattern-header, .pattern-body { padding: 18px; }
   .pattern-fields { grid-template-columns: 1fr; }
   .pattern-preview-toolbar { align-items: stretch; flex-direction: column; }
+  .pattern-preview-tabs { width: 100%; }
   .pattern-preview-tools { justify-content: space-between; width: 100%; margin-left: 0; }
   .pattern-preview { min-height: 220px; }
   .pattern-preview-actions .btn { width: 100%; }

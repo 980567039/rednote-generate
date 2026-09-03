@@ -796,9 +796,16 @@ async function openResult(item: SeriesProjectItem) {
     const images: GeneratedImage[] = record.outline.pages.map((page, index) => {
       const filename = generated[page.index] || generated[index] || ''
       const pageError = imageErrors[String(page.index)] ?? imageErrors[String(index)]
+      const outputs = page.pattern?.outputs
       return {
         index: page.index,
         url: filename && taskId ? getImageUrl(taskId, filename) : '',
+        ...(taskId && outputs ? {
+          patternAssets: {
+            ...(outputs.beads ? { beads: getImageUrl(taskId, outputs.beads, false) } : {}),
+            ...(outputs.ironed ? { ironed: getImageUrl(taskId, outputs.ironed, false) } : {}),
+          },
+        } : {}),
         status: filename ? 'done' : 'error',
         error: filename ? undefined : failureReason(pageError, '该页图片生成失败，可点击补全'),
         retryable: !filename

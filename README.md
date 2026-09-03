@@ -41,6 +41,15 @@
 启动脚本会检查依赖和端口，启动前端与后端，并在退出时清理本次启动的子进程。
 如果发布组件尚未初始化，脚本会先初始化固定版本的 Git 子模块；初始化失败不会影响生成和下载功能。
 
+拼豆图纸联动还需要同时启动 Perler to Perfect。在 Perler 仓库中执行其一键脚本（或手动运行 Vite）：
+
+```bash
+cd /path/to/perler-to-perfect
+./start.command
+```
+
+确认 `http://localhost:5174/` 能打开后，再在 RedInk 中点击“生成拼豆图纸”。两个应用默认通过 `http://localhost:5173`（RedInk）和 `http://localhost:5174`（Perler）互信；如果使用其他地址，请在构建前分别设置 `VITE_PERLER_ORIGIN` 与 `VITE_REDINK_ORIGIN`。
+
 - 前端：http://localhost:5173
 - 后端健康检查：http://localhost:12398/api/health
 
@@ -167,7 +176,7 @@ docker compose down
 
 该联动只面向系列合集的单张角色图片。按钮会把原图二进制安全交给 Perler to Perfect，不让对方跨域读取 RedInk 图片；默认本地地址分别为 `http://localhost:5173` 和 `http://localhost:5174`，线上使用精确 origin 配置互信。
 
-角色合集的原图以与 `main` 分支一致的通用图片提示词为基础，只追加角色素材所需的轻量视觉约束：单角色主体、完整居中、纯白或浅色极简背景，并禁止标题、标签、水印和海报式文字排版。原图不追加施工网格、色号、拼豆颗粒或材质规则。生成图纸时，RedInk 将原始图片直接交给 Perler to Perfect，由 Perler 当前的确定性自动算法完成一次前景识别、网格采样和拼豆色映射；流程中不再进行 AI 前置重绘、AI 图纸精修或二次转换。Perler 回传母版 PNG 和预览后，用户确认才会保存为 `pattern` 图片页。图例和分块 ZIP 仍由 Perler 本地下载，不会混入发布图片。
+角色合集的原图以与 `main` 分支一致的通用图片提示词为基础，只追加角色素材所需的轻量视觉约束：单角色主体、完整居中、纯白或浅色极简背景，并禁止标题、标签、水印和海报式文字排版。原图不追加施工网格、色号、拼豆颗粒或材质规则。生成图纸时，RedInk 将原始图片直接交给 Perler to Perfect，由 Perler 当前的确定性自动算法完成一次前景识别、网格采样和拼豆色映射；流程中不再进行 AI 前置重绘、AI 图纸精修或二次转换。Perler 一次回传方格施工图、拼豆实物效果图和熨烫成品效果图，用户确认后作为同一个 `pattern` 图片页的主图与附属资源保存。图例和分块 ZIP 仍由 Perler 本地下载，不会混入发布图片。
 
 交接协议、回传校验、幂等追加和发布兼容要求维护在 Perler to Perfect 的实施方案中；线上部署时请分别配置两个前端的 `VITE_PERLER_ORIGIN` 与 `VITE_REDINK_ORIGIN`。
 
@@ -193,6 +202,17 @@ Base URL 与 endpoint 应分别填写，不要把完整请求地址重复填入�
 lsof -nP -iTCP:12398 -sTCP:LISTEN
 lsof -nP -iTCP:5173 -sTCP:LISTEN
 ```
+
+### 生成图纸提示“连接 Perler 超时”
+
+这不是图片模型或历史记录服务的超时，而是 RedInk 没有收到 Perler 的自动握手。先检查 Perler 是否监听 5174：
+
+```bash
+lsof -nP -iTCP:5174 -sTCP:LISTEN
+curl -I http://localhost:5174/
+```
+
+如果没有监听进程，请启动 `perler-to-perfect/start.command`。如果页面可以打开但仍提示握手失败，检查两边的 `VITE_PERLER_ORIGIN`、`VITE_REDINK_ORIGIN` 是否为完整 origin（不带路径），以及线上响应头的 CSP `frame-ancestors` 是否允许 RedInk origin。
 
 ## 目录结构
 
