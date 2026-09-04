@@ -148,7 +148,7 @@ function inferTitle(message: string, fallbackTitle: string): string {
     AUTH_OR_PERMISSION: 'API Key 或权限不可用',
     RATE_LIMITED: '上游限流或配额不足',
     NETWORK_TIMEOUT: '网络请求超时',
-    PERLER_UNAVAILABLE: 'Perler 服务未连接',
+    PERLER_UNAVAILABLE: 'Perler 细调未连接',
     RESOURCE_NOT_FOUND: '资源不存在',
     UNKNOWN_ERROR: fallbackTitle
   }
@@ -166,7 +166,7 @@ function inferSuggestion(message: string): string {
     AUTH_OR_PERMISSION: '请检查 API Key、模型访问权限、账户余额和服务商配置。',
     RATE_LIMITED: '请稍后重试，或降低并发/检查账户配额。',
     NETWORK_TIMEOUT: '请检查网络、代理和服务商状态后重试。',
-    PERLER_UNAVAILABLE: '请先启动 Perler to Perfect（默认 http://localhost:5174），确认 RedInk 的 VITE_PERLER_ORIGIN 与 Perler 地址一致；若页面已加载但未握手，请检查 Perler 的 VITE_REDINK_ORIGIN 和 CSP frame-ancestors 配置。',
+    PERLER_UNAVAILABLE: '只有进入 Perler 细调时才需要启动 Perler to Perfect（默认 http://localhost:5174）；请确认 VITE_PERLER_ORIGIN、VITE_REDINK_ORIGIN 和 CSP frame-ancestors 配置一致。',
     RESOURCE_NOT_FOUND: '请返回列表刷新后重试。',
     UNKNOWN_ERROR: '请稍后重试；如果持续失败，请复制诊断信息反馈。'
   }

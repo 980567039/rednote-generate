@@ -15,6 +15,7 @@
  */
 import { defineStore } from 'pinia'
 import type { Page, SeriesRequestContext } from '../api'
+import { getImageUrl } from '../api/image'
 
 /**
  * 生成的图片信息
@@ -528,6 +529,65 @@ export const useGeneratorStore = defineStore('generator', {
       this.progress.phase = 'finished'
       this.progress.message = '拼豆图纸已追加到最后一页'
       this.stage = 'result'
+    },
+
+    /**
+     * 从当前结果页移除一个已删除的历史页面。
+     * 服务端会先完成文件和历史记录清理；这里只同步内存状态，避免
+     * 删除后刷新页面仍显示旧卡片。页面索引与 generated 数组始终保持对齐。
+     */
+    removePageResult(
+      index: number,
+      updated?: {
+        taskId?: string | null
+        generated?: string[]
+        pages?: Page[]
+      },
+    ) {
+      const pagePosition = this.outline.pages.findIndex(page => page.index === index)
+      if (pagePosition < 0) return false
+
+      this.outline.pages.splice(pagePosition, 1)
+      this.outline.pages.forEach((page, pageIndex) => {
+        page.index = pageIndex
+      })
+      this.syncRawFromPages()
+
+      const taskId = updated?.taskId ?? this.taskId
+      const hasUpdatedFiles = Array.isArray(updated?.generated)
+      this.images = this.images
+        .filter(image => image.index !== index)
+        .map(image => {
+          const next = image.index > index ? { ...image, index: image.index - 1 } : { ...image }
+          if (hasUpdatedFiles && taskId) {
+            const filename = updated?.generated?.[next.index] || ''
+            next.url = filename
+              ? `${getImageUrl(taskId, filename)}&t=${Date.now()}`
+              : ''
+            const page = updated?.pages?.find(item => item.index === next.index)
+            const outputs = page?.pattern?.outputs
+            if (outputs?.beads || outputs?.ironed) {
+              next.patternAssets = {
+                ...(outputs.beads ? { beads: `${getImageUrl(taskId, outputs.beads, false)}&t=${Date.now()}` } : {}),
+                ...(outputs.ironed ? { ironed: `${getImageUrl(taskId, outputs.ironed, false)}&t=${Date.now()}` } : {}),
+              }
+            } else {
+              delete next.patternAssets
+            }
+          }
+          return next
+        })
+        .sort((first, second) => first.index - second.index)
+
+      this.progress.total = this.outline.pages.length
+      this.progress.current = this.images.filter(image => image.status === 'done' && Boolean(image.url)).length
+      this.progress.status = this.images.every(image => image.status === 'done' && Boolean(image.url))
+        ? 'done'
+        : 'error'
+      this.progress.phase = 'finished'
+      this.progress.message = '页面已删除'
+      this.stage = 'result'
+      return true
     },
 
     /**

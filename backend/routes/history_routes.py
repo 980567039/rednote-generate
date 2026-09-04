@@ -15,7 +15,12 @@ import zipfile
 import logging
 import re
 from flask import Blueprint, request, jsonify, send_file
-from backend.services.history import ContentStatus, get_history_service
+from backend.errors import AppError
+from backend.services.history import (
+    ContentStatus,
+    HistoryPageDeletionConflictError,
+    get_history_service,
+)
 from .utils import api_error_response, normalize_error_result, validation_error
 
 logger = logging.getLogger(__name__)
@@ -373,6 +378,56 @@ def create_history_blueprint():
             return api_error_response(str(exc), status=404, context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id})
         except Exception as exc:
             return api_error_response(exc, context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id})
+
+    @history_bp.route('/history/<record_id>/pages/<int:page_index>', methods=['DELETE'])
+    @history_bp.route('/history/<record_id>/pattern-pages/<int:page_index>', methods=['DELETE'])
+    def delete_history_page(record_id, page_index):
+        """删除单页及其关联资源。
+
+        ``pages`` 是通用入口，允许删除原始图片或追加的拼豆图纸；后者
+        会同时清理 beads/ironed 附属输出。保留 ``pattern-pages`` 别名，
+        方便旧客户端按追加图纸的语义调用同一套安全校验。
+        """
+        context = {
+            "endpoint": "/api/history/<id>/pages/<page_index>",
+            "record_id": record_id,
+            "page_index": page_index,
+        }
+        try:
+            result = get_history_service().delete_page(record_id, page_index)
+            return jsonify({
+                "success": True,
+                "page_index": result["page_index"],
+                "deleted_type": result.get("deleted_type"),
+                "deleted_files": result.get("deleted_files", []),
+                "record": result["record"],
+            }), 200
+        except HistoryPageDeletionConflictError as exc:
+            suggestion = (
+                "请等待图片任务结束后再删除页面。"
+                if "仍在生成" in str(exc)
+                else "请先删除关联的拼豆图纸，再删除来源图片。"
+            )
+            return api_error_response(
+                AppError(
+                    code="PAGE_DELETE_CONFLICT",
+                    title="页面无法删除",
+                    detail=str(exc),
+                    suggestion=suggestion,
+                    status=409,
+                    retryable=False,
+                ),
+                context=context,
+            )
+        except (TypeError, ValueError) as exc:
+            return api_error_response(
+                validation_error(str(exc), "请检查要删除的页面后重试。"),
+                context=context,
+            )
+        except FileNotFoundError as exc:
+            return api_error_response(str(exc), status=404, context=context)
+        except Exception as exc:
+            return api_error_response(exc, context=context)
 
     @history_bp.route('/history/<record_id>', methods=['DELETE'])
     def delete_history(record_id):

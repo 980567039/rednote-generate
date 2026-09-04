@@ -153,6 +153,30 @@ export async function appendPatternPage(
   }
 }
 
+/** 删除历史记录中的单个页面（原始图片或追加的拼豆图纸）。 */
+export async function deleteHistoryPage(
+  recordId: string,
+  pageIndex: number,
+): Promise<{
+  success: boolean
+  page_index?: number
+  deleted_type?: string
+  deleted_files?: string[]
+  record?: HistoryDetail
+  error?: AppError | string
+  error_message?: string
+}> {
+  try {
+    const response = await axios.delete(
+      `${API_BASE_URL}/history/${encodeURIComponent(recordId)}/pages/${encodeURIComponent(String(pageIndex))}`,
+      { timeout: 10000 },
+    )
+    return response.data
+  } catch (error: any) {
+    return { success: false, ...getApiErrorPayload(error, '删除页面失败') }
+  }
+}
+
 export async function checkHistoryExists(recordId: string): Promise<boolean> {
   try {
     const response = await axios.get(

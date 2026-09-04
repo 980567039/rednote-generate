@@ -36,25 +36,45 @@ SYSTEMIC_ERROR_CODES = {
     "UPSTREAM_UNAVAILABLE",
 }
 
+CHARACTER_SHEET_ASPECT_RATIO = "1:1"
+CHARACTER_SHEET_IMAGE_SIZE = "1024x1024"
+
 
 # 角色合集图片会直接作为后续 Perler 转换的输入。通用图片提示词允许封面
 # 使用标题/副标题，这对普通社交媒体配图有帮助，却会让角色素材变成海报，
-# 也会把页面说明误画进图里。这里仅为 character_sheet 增加轻量的视觉约束；
+# 也会把页面说明误画进图里。character_sheet 改用独立的无文字提示头并增加视觉约束；
 # 网格、色号和拼豆材质等施工规则仍由 Perler 负责，不能提前塞给图片模型。
 CHARACTER_SHEET_IMAGE_GUIDANCE = (
     "\n\n【角色转换素材图专用要求｜优先执行】\n"
-    "这是一张供后续图案转换使用的干净二维角色原图，不是海报、宣传卡片或文字排版图。"
+    "这是一张供后续图案转换使用的 1:1 正方形、干净二维角色原图，不是海报、宣传卡片或文字排版图。"
     "页面内容中的角色名、作品名、主题和说明只用于理解，"
-    "不要把这些文字绘制到图片中。\n"
-    "画面只保留一个完整且容易识别的角色作为唯一视觉主体；角色居中，完整显示头部、"
-    "身体、双腿和鞋子，不裁切，角色高度约占画布 80%–90%，不要加入其他角色。\n"
+    "不要生成角色名字和描述文字，也不要把这些文字绘制到图片中。\n"
+    "画面只保留一个放大且容易识别的角色作为唯一视觉主体；优先采用上半身/胸像构图，"
+    "突出头部、脸部、发型和服装细节；也可以采用紧凑的 Q 版全身构图（大头、短身、四肢集中）。"
+    "不要使用细长的成人全身站立构图、远景人物或从头到脚留大块空白。角色居中且不裁切，"
+    "主体高度约占画布 85%–95%、宽度约占 75%–90%，边缘只留 5%–10% 的安全留白，不要加入其他角色。\n"
     "背景必须简单、干净、低干扰：优先纯白或单一浅色背景和适量留白；不要场景背景、"
     "复杂纹理、装饰贴纸、边框、拼贴、统计信息或无关道具，只保留角色必要的标志性道具。\n"
     "禁止标题、字幕、标签、说明文字、对话框、数字、Logo、水印、伪文字和海报式排版；"
-    "即使通用模板允许封面文字，本图也不要添加任何文字。\n"
+    "即使通用模板或参考图中存在文字，本图也不要添加或复制任何文字。\n"
     "保持参考图中的角色身份、发型、脸部、服饰、表情和主要配色；使用清晰轮廓和干净色块，"
     "减少细碎噪点、杂色、过度阴影和高光。保持正常二维角色插画，不要预先绘制网格、"
     "施工线、色号、颗粒、珠孔或 3D 塑料材质；后续转换由工具完成。"
+)
+
+
+# 通用 image_prompt.txt 为普通社交媒体封面设计，明确允许封面标题和副标题。
+# 角色素材图不能继续沿用这套文字策略，否则模型即使收到末尾的禁止文字规则，
+# 仍可能把角色名和作品名排到左上角。角色模式会先切换到这个纯素材提示头，
+# 再追加上面的视觉约束。
+CHARACTER_SHEET_PROMPT_HEADER = (
+    "生成一张 1:1 正方形的高质量二维角色素材图，只绘制一个放大的角色主体。"
+    "优先上半身/胸像细节，或使用紧凑的 Q 版全身构图；避免细长的成人全身站立构图。"
+    "角色主体需要尽量填满画布，以适配 104×104 和 200×200 方形拼豆图纸。"
+    "这不是海报、封面、宣传卡片或社交媒体文字排版图。"
+    "画面中不要出现任何角色名字、作品名、主题名或描述文字。"
+    "参考图中的文字、Logo 和排版也不要复制。"
+    "下面的角色信息仅用于模型识别和绘画，绝不能作为画面文字输出："
 )
 
 
@@ -260,6 +280,81 @@ class ImageService:
                 lines.append(line)
 
         return "\n".join(lines).strip()
+
+    @staticmethod
+    def _character_sheet_identity_content(page_content: str) -> str:
+        """整理角色身份输入，避免把页面标签和主题说明当成画面文案。
+
+        角色名和外观描述仍需传给图片模型，才能确定要画谁；但“封面”“所属主题”
+        以及页面制作说明会明显诱导模型生成左上角标题。因此这里只保留角色身份和
+        用户/模板提供的外观信息，并把它们放进明确的“不可显示”区块。
+        """
+        if not isinstance(page_content, str):
+            return "角色身份：未命名角色"
+
+        content = ImageService._clean_character_sheet_page_content(page_content)
+        lines = []
+        for raw_line in content.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            # 页面类型是工作流元数据，不是角色视觉信息。
+            if re.fullmatch(r"\[[^\]]+\]", line):
+                continue
+            if re.match(r"^所属主题\s*[：:]", line):
+                continue
+            if re.match(r"^(?:本页只展示|不讲连续故事|不与其他角色合并|不添加大段文字)", line):
+                continue
+            line = re.sub(r"^精细角色设定图\s*[：:]\s*", "角色身份：", line)
+            lines.append(line)
+
+        return "\n".join(lines).strip() or "角色身份：未命名角色"
+
+    @staticmethod
+    def _build_character_sheet_prompt(raw_prompt: str, page_content: str) -> str:
+        """用纯素材提示替换通用封面的文字策略。
+
+        保留自定义短模板的开头，兼容第三方图片服务商的自定义 prompt；对项目自带
+        的完整/短模板则不保留“封面可放标题”等互相冲突的规则，只留下角色身份输入。
+        """
+        raw_prompt = str(raw_prompt or "").strip()
+        generic_markers = (
+            "本页素材（用于理解主题、事实和视觉场景；并非都要写进图片）",
+            "本页素材（用于理解，不要逐字照抄到图片）",
+            "封面最多保留主标题",
+            "封面：主标题",
+            "文字策略：",
+        )
+        if any(marker in raw_prompt for marker in generic_markers):
+            prompt_header = CHARACTER_SHEET_PROMPT_HEADER
+        else:
+            # 自定义模板往往只有“页面：{page_content}”等上下文，没有通用封面规则；
+            # 保留其内容可避免破坏现有服务商配置和调用方约定。
+            prompt_header = raw_prompt
+            # 即使自定义模板没有通用文字策略，也不要把页面元数据原样送给
+            # 模型，尤其是“所属主题”这类最容易被排成左上角标题的字段。页面
+            # 内容会在下面的“仅供识别”区块中重新提供，避免同一角色名在提示头
+            # 和身份区各出现一次。
+            prompt_header = re.sub(
+                r"(?m)^\s*(?:\[[^\]]+\]|所属主题\s*[：:].*|"
+                r"本页只展示.*|不讲连续故事.*|不与其他角色合并.*|不添加大段文字.*|"
+                r"(?:主题|创作主题|页面|类型)\s*[：:].*)\s*$",
+                "",
+                prompt_header,
+            ).strip()
+            if not prompt_header:
+                prompt_header = CHARACTER_SHEET_PROMPT_HEADER
+
+        identity = ImageService._character_sheet_identity_content(page_content)
+        identity_block = (
+            "\n\n【仅供识别的角色信息｜不可显示】\n"
+            "---\n"
+            f"{identity}\n"
+            "---\n"
+            "请只将上述信息用于确定角色外观。不要复制、排版或绘制其中任何名字、主题、"
+            "标签、说明或其他文字；左上角、右上角、边缘和背景都必须保持无文字。"
+        )
+        return f"{prompt_header}{identity_block}"
 
     @staticmethod
     def _character_identity_from_context(series_context: str) -> str:
@@ -526,10 +621,10 @@ class ImageService:
         index = page["index"]
         page_type = page["type"]
         page_content = page["content"]
-        # 角色合集的图片以与 main 分支相同的通用 image_prompt 为基础。
-        # 过去这里把角色页误判为“拼豆源图”，追加了施工图约束并切成
-        # 1:1，导致模型直接输出混杂颜色/网格倾向的素材。显式模式优先，
-        # 旧任务没有 content_mode 时再使用冻结上下文中的标记兜底。
+        # 角色合集使用独立的纯素材提示词，避免通用封面规则诱导模型生成文字。
+        # 过去这里把角色页误判为“拼豆施工图”，直接追加了网格和材质约束，
+        # 导致模型输出混杂颜色/网格倾向的素材。现在只固定正方形画布，实际网格
+        # 转换仍交给 Perler。显式模式优先，旧任务没有 content_mode 时再用标记兜底。
         is_character_sheet = self._is_character_sheet(content_mode, series_context)
         if is_character_sheet:
             page_content = self._clean_character_sheet_page_content(page_content)
@@ -550,24 +645,30 @@ class ImageService:
             self._mark_attempt(task_id, index, phase, retry_count + 1)
             logger.debug(f"生成图片 [{index}]: type={page_type}")
 
-            # 根据配置选择模板（短 prompt 或完整 prompt）
+            # 根据配置选择模板（短 prompt 或完整 prompt）。角色素材图会在
+            # 格式化后替换掉通用模板的封面文字策略，避免模型把角色名排成标题。
             if self.use_short_prompt and self.prompt_template_short:
                 # 短 prompt 模式：只包含页面类型和内容
-                prompt = self.prompt_template_short.format(
+                raw_prompt = self.prompt_template_short.format(
                     page_content=page_content,
                     page_type=page_type
                 )
-                logger.debug(f"  使用短 prompt 模式 ({len(prompt)} 字符)")
+                logger.debug(f"  使用短 prompt 模式 ({len(raw_prompt)} 字符)")
             else:
                 # 完整 prompt 模式：包含大纲和用户需求
-                prompt = self.prompt_template.format(
+                raw_prompt = self.prompt_template.format(
                     page_content=page_content,
                     page_type=page_type,
                     full_outline=full_outline,
                     user_topic=user_topic if user_topic else "未提供"
                 )
+            prompt = (
+                self._build_character_sheet_prompt(raw_prompt, page_content)
+                if is_character_sheet
+                else raw_prompt
+            )
 
-            # character_sheet 图片以 main 的通用提示词为基础；系列上下文仍会
+            # character_sheet 图片只保留角色身份输入和专用视觉规则；系列上下文仍会
             # 传给文案/大纲服务，但不把整套系列规则直接灌进图片模型。
             prompt_series_context = series_context
             # 显式故事模式优先于旧记录中的角色标记；不要把冲突的旧
@@ -591,8 +692,7 @@ class ImageService:
                     "渐变纹理和多个独立小物件。画面优先输出适合 104×104 网格采样的高分辨率正方形源图。"
                 )
             if is_character_sheet:
-                # 通用模板的封面规则允许标题/副标题；角色素材图必须覆盖这条
-                # 规则，避免角色名称、作品名或页面说明被模型排成海报文字。
+                # 追加专用无文字约束，避免角色名称、作品名或页面说明被模型排成海报文字。
                 prompt += CHARACTER_SHEET_IMAGE_GUIDANCE
 
             # 调用生成器生成图片。所有路径共用 limiter，避免批量和重试打爆上游。
@@ -603,13 +703,18 @@ class ImageService:
                     image_data = self.generator.generate_image(
                         prompt=prompt,
                         aspect_ratio=(
-                            self.provider_config.get('pattern_source_aspect_ratio', '1:1')
+                            CHARACTER_SHEET_ASPECT_RATIO
+                            if is_character_sheet
+                            else self.provider_config.get('pattern_source_aspect_ratio', '1:1')
                             if clean_pattern_source
                             else self.provider_config.get('default_aspect_ratio', '3:4')
                         ),
                         temperature=self.provider_config.get('temperature', 1.0),
                         model=self.provider_config.get('model', 'gemini-3-pro-image-preview'),
                         reference_image=google_reference,
+                        # 参考图包装器默认会强调“排版/字体风格”；角色素材图必须
+                        # 只继承人物视觉，不要让参考图中的文字布局被复制。
+                        direct_reference_prompt=is_character_sheet,
                     )
                 elif self.provider_config.get('type') == 'image_api':
                     logger.debug(f"  使用 Image API 生成器")
@@ -624,19 +729,29 @@ class ImageService:
                     image_data = self.generator.generate_image(
                         prompt=prompt,
                         aspect_ratio=(
-                            self.provider_config.get('pattern_source_aspect_ratio', '1:1')
+                            CHARACTER_SHEET_ASPECT_RATIO
+                            if is_character_sheet
+                            else self.provider_config.get('pattern_source_aspect_ratio', '1:1')
                             if clean_pattern_source
                             else self.provider_config.get('default_aspect_ratio', '3:4')
                         ),
                         temperature=self.provider_config.get('temperature', 1.0),
                         model=self.provider_config.get('model', 'nano-banana-2'),
                         reference_images=reference_images if reference_images else None,
+                        # 同上：避免参考图增强提示再次引导模型生成标题或标签。
+                        direct_reference_prompt=is_character_sheet,
                     )
                 else:
                     logger.debug(f"  使用 OpenAI 兼容生成器")
                     image_data = self.generator.generate_image(
                         prompt=prompt,
-                        size=self.provider_config.get('default_size', '1024x1024'),
+                        # OpenAI-compatible providers receive dimensions instead of
+                        # aspect_ratio; force a square canvas for bead-board output.
+                        size=(
+                            CHARACTER_SHEET_IMAGE_SIZE
+                            if is_character_sheet
+                            else self.provider_config.get('default_size', '1024x1024')
+                        ),
                         model=self.provider_config.get('model'),
                         quality=self.provider_config.get('quality', 'standard'),
                     )

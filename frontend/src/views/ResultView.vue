@@ -69,7 +69,7 @@
           <!-- Image Area -->
           <div
             v-if="image.url"
-            style="position: relative; aspect-ratio: 3/4; overflow: hidden; cursor: pointer;"
+            :style="{ position: 'relative', aspectRatio: isCharacterSheet ? '1 / 1' : '3 / 4', overflow: 'hidden', cursor: 'pointer' }"
             @click="viewImage(image.url)"
           >
             <img
@@ -100,6 +100,14 @@
                 重新生成
               </button>
               <button
+                class="hover-action-btn danger-action-btn"
+                type="button"
+                :disabled="deletingIndex === image.index"
+                @click.stop="deleteResultPage(image)"
+              >
+                {{ deletingIndex === image.index ? '删除中…' : (isPatternImage(image) ? '删除图纸' : '删除图片') }}
+              </button>
+              <button
                 v-if="canCreatePattern(image)"
                 class="hover-action-btn"
                 type="button"
@@ -127,6 +135,14 @@
                 :disabled="regeneratingIndex === image.index || isPatternImage(image)"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+              </button>
+              <button
+                style="border: none; background: none; color: var(--primary-active); cursor: pointer; font-size: 12px;"
+                type="button"
+                :disabled="deletingIndex === image.index"
+                @click="deleteResultPage(image)"
+              >
+                {{ deletingIndex === image.index ? '删除中…' : (isPatternImage(image) ? '删除图纸' : '删除图片') }}
               </button>
               <button
                 v-if="canCreatePattern(image)"
@@ -262,6 +278,9 @@
   color: white;
   transform: translateY(-1px);
 }
+.danger-action-btn:hover {
+  background: var(--primary-active);
+}
 
 .publish-button { white-space: nowrap; }
 .result-actions-wrap { display: grid; justify-items: end; gap: 6px; }
@@ -291,6 +310,7 @@ import { useRouter } from 'vue-router'
 import { useGeneratorStore } from '../stores/generator'
 import {
   appendPatternPage,
+  deleteHistoryPage,
   regenerateImage,
 } from '../api'
 import ContentDisplay from '../components/result/ContentDisplay.vue'
@@ -319,6 +339,7 @@ const previewImage = ref<{ src: string; alt: string } | null>(null)
 const regenerateTarget = ref<any | null>(null)
 const showPublishModal = ref(false)
 const patternGeneratingIndex = ref<number | null>(null)
+const deletingIndex = ref<number | null>(null)
 const isAppendingPattern = ref(false)
 const isRefiningPattern = ref(false)
 const patternPending = ref<{
@@ -341,6 +362,7 @@ const patternModalVisible = computed(() => patternTarget.value !== null)
 const failedImages = computed(() => store.images.filter(image => image.status !== 'done' || !image.url))
 const hasFailedImages = computed(() => failedImages.value.length > 0)
 const failedCount = computed(() => failedImages.value.length)
+const isCharacterSheet = computed(() => store.seriesContext.content_mode === 'character_sheet')
 
 function setError(nextError: AppError | null) {
   error.value = nextError
@@ -420,6 +442,48 @@ const downloadAll = () => {
   }
 }
 
+const deleteResultPage = async (image: { index: number; url: string }) => {
+  if (
+    !store.recordId
+    || deletingIndex.value !== null
+    || patternModalVisible.value
+    || patternGeneratingIndex.value !== null
+  ) return
+
+  const page = store.outline.pages.find(item => item.index === image.index)
+  if (!page) return
+  const isPattern = page.type === 'pattern'
+  const label = isPattern ? '拼豆图纸' : '原始图片'
+  if (!window.confirm(`确定删除第 ${image.index + 1} 页${label}吗？此操作不可恢复。`)) return
+
+  deletingIndex.value = image.index
+  error.value = null
+  try {
+    const response = await deleteHistoryPage(store.recordId, image.index)
+    if (!response.success) {
+      error.value = normalizeApiError(
+        response.error || response.error_message || `删除${label}失败`,
+        `删除${label}失败`,
+      )
+      return
+    }
+    // The backend has already atomically removed the metadata and task-local
+    // assets. Keep the current result view in lockstep without reloading the
+    // whole work (which would discard in-memory references/user images).
+    store.removePageResult(image.index, {
+      taskId: response.record?.images.task_id,
+      generated: response.record?.images.generated,
+      pages: response.record?.outline.pages,
+    })
+    if (previewImage.value?.src === image.url) previewImage.value = null
+    if (regenerateTarget.value?.index === image.index) regenerateTarget.value = null
+  } catch (reason: unknown) {
+    error.value = normalizeApiError(reason, `删除${label}失败`)
+  } finally {
+    deletingIndex.value = null
+  }
+}
+
 const generatePattern = (image: { index: number; url: string }) => {
   if (
     !store.recordId
@@ -480,9 +544,9 @@ const startAutomaticPattern = async (settings: PerlerPatternSettings) => {
   )
 
   try {
-    // Match Perler-to-perfect's AutoMode: hand the original raster to the
-    // deterministic worker once. There is no AI redraw before or after the
-    // grid conversion, so the preview and editable pattern share one source.
+    // Match Perler-to-perfect's AutoMode locally. The original raster is sent
+    // directly to the same deterministic worker; Perler is only opened by the
+    // explicit refine action below.
     const job = generatePatternAutomatically({
       recordId,
       imageIndex: target.index,
@@ -549,10 +613,27 @@ const refinePatternWithPerler = async () => {
       imageUrl: `${target.url.split('?')[0]}?thumbnail=false`,
       fileName: `redink-page-${target.index + 1}.png`,
       settings: patternSettings.value,
+      cells: pending.result.cells,
+      metadata: pending.result.metadata,
     })
     if (patternTarget.value?.index !== target.index) return
-    patternPending.value = { ...pending, result }
-    setPatternPreview(result)
+    // Older Perler builds only return the edited grid PNG. Keep the local
+    // effect renders in that case so confirming the append still persists
+    // all three outputs. Newer builds return fresh effects, which always win.
+    const mergedResult: PerlerPatternResult = {
+      ...result,
+      ...(result.beads || result.preview || pending.result.beads || pending.result.preview
+        ? { beads: result.beads ?? result.preview ?? pending.result.beads ?? pending.result.preview }
+        : {}),
+      ...(result.ironed || pending.result.ironed
+        ? { ironed: result.ironed ?? pending.result.ironed }
+        : {}),
+      ...(result.preview || result.beads || pending.result.preview || pending.result.beads
+        ? { preview: result.preview ?? result.beads ?? pending.result.preview ?? pending.result.beads }
+        : {}),
+    }
+    patternPending.value = { ...pending, result: mergedResult }
+    setPatternPreview(mergedResult)
   } catch (reason: unknown) {
     patternErrorMessage.value = reason instanceof Error ? reason.message : 'Perler 编辑未完成，自动生成的预览已保留。'
     error.value = normalizeApiError(reason, 'Perler 编辑未完成，自动生成的预览已保留')

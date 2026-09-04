@@ -1,25 +1,14 @@
 import { isValidPerlerSettings, type PerlerPatternSettings } from './perlerSettings'
 import { apiFetch } from '../api/client'
+import { generatePatternLocally } from './localPerler'
 
 const MANUAL_CHANNEL = 'redink-perler'
-const AUTO_CHANNEL = 'redink-perler-auto'
 const VERSION = 1
 const MAX_SOURCE_BYTES = 25 * 1024 * 1024
 const MAX_PATTERN_BYTES = 20 * 1024 * 1024
 const MAX_PREVIEW_BYTES = 10 * 1024 * 1024
-const CONNECTION_TIMEOUT_MS = 15 * 1000
 const HANDOFF_TIMEOUT_MS = 5 * 60 * 1000
 const ALLOWED_SOURCE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp'])
-const AUTO_PROGRESS_STAGES = new Set<PerlerAutoProgressStage>([
-  'prepare',
-  'sample',
-  'select',
-  'map',
-  'cleanup',
-  'background',
-  'refine',
-  'render',
-])
 
 export interface PerlerPatternMetadata {
   columns: number
@@ -33,6 +22,8 @@ export interface PerlerPatternMetadata {
 export interface PerlerPatternResult {
   requestId: string
   pattern: Blob
+  /** The exact cell matrix used to render the local outputs. */
+  cells?: Uint16Array
   /** Cylindrical, un-ironed bead rendering. */
   beads?: Blob
   /** Flattened, heat-pressed rendering. */
@@ -71,6 +62,8 @@ interface PerlerMessage {
   type: string
   requestId?: string
   pattern?: ArrayBuffer
+  cells?: ArrayBuffer
+  grid?: { columns?: unknown; rows?: unknown }
   mimeType?: string
   beads?: ArrayBuffer
   beadsMimeType?: string
@@ -126,22 +119,6 @@ function validMetadata(value: unknown): value is PerlerPatternMetadata {
   )
 }
 
-function validProgress(message: PerlerMessage): message is PerlerMessage & {
-  stage: PerlerAutoProgressStage
-  completed: number
-  total: number
-} {
-  return (
-    typeof message.stage === 'string'
-    && AUTO_PROGRESS_STAGES.has(message.stage as PerlerAutoProgressStage)
-    && Number.isInteger(message.completed)
-    && (message.completed as number) >= 0
-    && Number.isInteger(message.total)
-    && (message.total as number) >= 1
-    && (message.completed as number) <= (message.total as number)
-  )
-}
-
 function randomRequestId(): string {
   return typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
@@ -154,11 +131,16 @@ function validateBridgeInput(input: {
   source?: Blob
   imageIndex: number
   settings?: PerlerPatternSettings
+  cells?: Uint16Array
+  metadata?: PerlerPatternMetadata
 }) {
   if (!input.recordId.trim()) throw new Error('缺少历史记录 ID，无法生成拼豆图纸。')
   if (!input.imageUrl?.trim() && !input.source) throw new Error('缺少原图，无法生成拼豆图纸。')
   if (!Number.isInteger(input.imageIndex) || input.imageIndex < 0) throw new Error('原图页码无效。')
   if (input.settings && !isValidPerlerSettings(input.settings)) throw new Error('拼豆图纸规格无效。')
+  if (input.cells && input.metadata && input.cells.length !== input.metadata.columns * input.metadata.rows) {
+    throw new Error('网格数据长度与图纸元数据不一致。')
+  }
 }
 
 async function sourceImageBytes(input: { imageUrl?: string; source?: Blob }, signal?: AbortSignal): Promise<{
@@ -222,8 +204,19 @@ function patternResultFromMessage(
   if (requireEffects && (!beadPreview || !ironed)) {
     throw new Error('Perler 未回传完整的拼豆实物和熨烫成品效果图。')
   }
+  let cells: Uint16Array | undefined
+  if (message.cells instanceof ArrayBuffer) {
+    const expectedBytes = message.metadata.columns * message.metadata.rows * 2
+    if (message.cells.byteLength !== expectedBytes) throw new Error('Perler 回传的网格长度与元数据不一致。')
+    const decoded = new Uint16Array(message.cells)
+    for (const value of decoded) {
+      if (value !== 0xffff && value >= 221) throw new Error('Perler 回传了未知色板索引。')
+    }
+    cells = decoded
+  }
   return {
     requestId,
+    ...(cells ? { cells } : {}),
     pattern: new Blob([message.pattern], { type: 'image/png' }),
     ...(beadPreview ? { beads: beadPreview, preview: beadPreview } : {}),
     ...(ironed ? { ironed } : {}),
@@ -238,6 +231,9 @@ export async function generatePatternWithPerler(input: {
   imageIndex: number
   fileName?: string
   settings?: PerlerPatternSettings
+  /** Existing local matrix to open in Perler without recalculating it. */
+  cells?: Uint16Array
+  metadata?: PerlerPatternMetadata
 }): Promise<PerlerPatternResult> {
   validateBridgeInput(input)
   const origin = configuredPerlerOrigin()
@@ -269,11 +265,14 @@ export async function generatePatternWithPerler(input: {
       try {
         const transfer = sourceBytes
         sourceBytes = null
+        const matrix = input.cells ? input.cells.slice() : null
+        const matrixBuffer = matrix ? matrix.buffer as ArrayBuffer : null
+        const useMatrixImport = Boolean(matrixBuffer && input.metadata)
         popup.postMessage(
           {
             channel: MANUAL_CHANNEL,
             version: VERSION,
-            type: 'IMPORT_IMAGE',
+            type: useMatrixImport ? 'IMPORT_PATTERN' : 'IMPORT_IMAGE',
             requestId,
             context: {
               recordId: input.recordId,
@@ -283,9 +282,17 @@ export async function generatePatternWithPerler(input: {
             image: transfer,
             mimeType,
             ...(input.settings ? { settings: { ...input.settings } } : {}),
+            ...(useMatrixImport ? {
+              cells: matrixBuffer,
+              grid: {
+                columns: input.metadata!.columns,
+                rows: input.metadata!.rows,
+              },
+              metadata: { ...input.metadata },
+            } : {}),
           },
           origin,
-          [transfer],
+          matrixBuffer ? [transfer, matrixBuffer] : [transfer],
         )
       } catch (reason) {
         finishError(reason)
@@ -326,6 +333,7 @@ export async function generatePatternWithPerler(input: {
   })
 }
 
+/** Generate the pattern locally with the same MVP algorithm as Perler. */
 export function generatePatternAutomatically(input: {
   recordId: string
   imageUrl?: string
@@ -336,183 +344,5 @@ export function generatePatternAutomatically(input: {
   onReady?: () => void
   onProgress?: (progress: PerlerProgressUpdate) => void
 }): PerlerAutoJob {
-  validateBridgeInput(input)
-  const origin = configuredPerlerOrigin()
-  if (!origin) throw new Error('Perler 地址配置无效，必须填写不带路径的 HTTP(S) origin。')
-  const requestId = randomRequestId()
-  const perlerUrl = new URL('/', origin)
-  perlerUrl.searchParams.set('mode', 'auto')
-  perlerUrl.searchParams.set('handoff', requestId)
-
-  const iframe = document.createElement('iframe')
-  iframe.title = 'Perler 后台图纸生成器'
-  iframe.setAttribute('aria-hidden', 'true')
-  Object.assign(iframe.style, {
-    position: 'fixed',
-    left: '-10000px',
-    top: '-10000px',
-    width: '1px',
-    height: '1px',
-    border: '0',
-    opacity: '0',
-    pointerEvents: 'none',
-  })
-  document.body.appendChild(iframe)
-  const perlerWindow = iframe.contentWindow
-  if (!perlerWindow) {
-    iframe.remove()
-    throw new Error('无法创建 Perler 后台生成窗口。')
-  }
-
-  const abortController = new AbortController()
-  let cancel: () => void = () => undefined
-  const result = new Promise<PerlerPatternResult>((resolve, reject) => {
-    let settled = false
-    let ready = false
-    let iframeLoaded = false
-    let sent = false
-    let sourceBytes: ArrayBuffer | null = null
-    let sourceMimeType = 'image/png'
-    let connectionTimeout = 0
-    let totalTimeout = 0
-
-    const cleanup = () => {
-      window.removeEventListener('message', onMessage)
-      iframe.removeEventListener('load', onLoad)
-      iframe.removeEventListener('error', onLoadError)
-      window.clearTimeout(connectionTimeout)
-      window.clearTimeout(totalTimeout)
-      abortController.abort()
-      iframe.remove()
-      sourceBytes = null
-    }
-    const finishError = (reason: unknown) => {
-      if (settled) return
-      settled = true
-      cleanup()
-      reject(reason instanceof Error ? reason : new Error(String(reason)))
-    }
-    const finishSuccess = (pattern: PerlerPatternResult) => {
-      if (settled) return
-      settled = true
-      cleanup()
-      resolve(pattern)
-    }
-    const sendSource = () => {
-      if (!ready || sent || settled || !sourceBytes) return
-      try {
-        sent = true
-        const transfer = sourceBytes
-        sourceBytes = null
-        perlerWindow.postMessage(
-          {
-            channel: AUTO_CHANNEL,
-            version: VERSION,
-            // Keep the transport envelope at v1 while advertising the
-            // additive auto-output contract understood by Perler's current
-            // AutoMode. Older builds ignore this unknown field.
-            protocolVersion: 2,
-            type: 'AUTO_GENERATE',
-            requestId,
-            context: {
-              recordId: input.recordId,
-              imageIndex: input.imageIndex,
-              fileName: input.fileName || `redink-page-${input.imageIndex + 1}.png`,
-            },
-            image: transfer,
-            mimeType: sourceMimeType,
-            settings: {
-              ...input.settings,
-              // Match Perler's current AutoMode defaults explicitly so the
-              // executed settings and the returned metadata cannot diverge.
-              profile: 'balanced',
-              sourceKind: 'original',
-              sourceImageIndex: input.imageIndex,
-              removeBorderBackground: true,
-            },
-          },
-          origin,
-          [transfer],
-        )
-      } catch (reason) {
-        finishError(reason)
-      }
-    }
-    const onMessage = (event: MessageEvent<unknown>) => {
-      if (event.source !== perlerWindow || event.origin !== origin || !validMessage(event.data, AUTO_CHANNEL)) return
-      const message = event.data
-      if (message.requestId !== requestId) return
-      if (message.type === 'AUTO_READY') {
-        if (ready) return
-        ready = true
-        window.clearTimeout(connectionTimeout)
-        input.onReady?.()
-        sendSource()
-        return
-      }
-      if (message.type === 'AUTO_ERROR') {
-        if (typeof message.message !== 'string' || !message.message.trim()) {
-          finishError(new Error('Perler 回传的错误信息无效。'))
-          return
-        }
-        finishError(new Error(message.message))
-        return
-      }
-      if (message.type === 'AUTO_PROGRESS') {
-        if (!validProgress(message)) {
-          finishError(new Error('Perler 回传的生成进度无效。'))
-          return
-        }
-        input.onProgress?.({
-          stage: message.stage,
-          completed: message.completed,
-          total: message.total,
-        })
-        return
-      }
-      if (message.type !== 'AUTO_PATTERN_READY') return
-      try {
-        finishSuccess(patternResultFromMessage(message, requestId, true, message.protocolVersion === 2))
-      } catch (reason) {
-        finishError(reason)
-      }
-    }
-
-    const onLoad = () => {
-      iframeLoaded = true
-    }
-    const onLoadError = () => {
-      finishError(new Error(`Perler 页面无法加载（${origin}），请确认服务已启动且地址配置正确。`))
-    }
-
-    cancel = () => finishError(new PerlerBridgeCancelledError())
-    window.addEventListener('message', onMessage)
-    iframe.addEventListener('load', onLoad)
-    iframe.addEventListener('error', onLoadError)
-    iframe.src = perlerUrl.toString()
-    connectionTimeout = window.setTimeout(
-      () => finishError(new Error(
-        iframeLoaded
-          ? `Perler 页面已加载但没有完成 RedInk 握手，请检查 Perler 的 VITE_REDINK_ORIGIN 与 CSP frame-ancestors 配置（${origin}）。`
-          : `连接 Perler 超时，未能访问 ${origin}。请先启动 Perler to Perfect，并确认地址与 VITE_PERLER_ORIGIN 一致。`,
-      )),
-      CONNECTION_TIMEOUT_MS,
-    )
-    totalTimeout = window.setTimeout(
-      () => finishError(new Error('生成拼豆图纸超时，请重试或进入 Perler 手动生成。')),
-      HANDOFF_TIMEOUT_MS,
-    )
-    void sourceImageBytes(input, abortController.signal)
-      .then(source => {
-        sourceBytes = source.bytes
-        sourceMimeType = source.mimeType
-        sendSource()
-      })
-      .catch(reason => {
-        if (reason instanceof DOMException && reason.name === 'AbortError') return
-        finishError(reason)
-      })
-  })
-
-  return { requestId, result, cancel: () => cancel() }
+  return generatePatternLocally(input)
 }

@@ -4,8 +4,8 @@
       <header class="pattern-header">
         <div>
           <h2 id="pattern-dialog-title">生成第 {{ pageNumber }} 页的拼豆图纸和效果图</h2>
-          <p v-if="step === 'config'">输入成品网格规格，Perler 将在后台自动生成。</p>
-          <p v-else-if="step === 'progress'">正在后台处理原图，请保持当前页面打开。</p>
+          <p v-if="step === 'config'">输入成品网格规格，系统将在本机后台生成。</p>
+          <p v-else-if="step === 'progress'">正在本机处理原图，请保持当前页面打开。</p>
           <p v-else>确认后会保存方格图纸、拼豆实物和熨烫成品，并追加到最后一页。</p>
         </div>
         <button class="pattern-close" type="button" :disabled="busy" aria-label="关闭" @click="close">×</button>
@@ -80,7 +80,7 @@
           :aria-label="`全屏查看${activePreviewLabel}`"
           @click="openFullscreen"
         >
-          <img :src="activePreviewUrl" :alt="`Perler ${activePreviewLabel}`" />
+          <img :src="activePreviewUrl" :alt="`拼豆 ${activePreviewLabel}`" />
           <span class="pattern-preview-hint">点击查看原始尺寸</span>
         </button>
         <div v-else class="pattern-preview pattern-preview-empty">
@@ -94,7 +94,7 @@
         <footer class="pattern-actions pattern-preview-actions">
           <button class="btn btn-secondary" type="button" :disabled="busy" @click="close">暂不追加</button>
           <button class="btn btn-secondary" type="button" :disabled="busy" @click="$emit('refine')">
-            {{ isRefining ? '等待 Perler 回传…' : '在 Perler 中编辑' }}
+            {{ isRefining ? '等待 Perler 回传…' : '在 Perler 中细调' }}
           </button>
           <button class="btn btn-primary" type="button" :disabled="busy" @click="$emit('append')">
             {{ isAppending ? '追加中…' : '确认追加' }}
@@ -134,7 +134,7 @@
             v-if="activePreviewUrl"
             :key="activePreviewUrl"
             :src="activePreviewUrl"
-            :alt="`Perler ${activePreviewLabel}全尺寸预览`"
+            :alt="`拼豆 ${activePreviewLabel}全尺寸预览`"
             :style="fullscreenImageStyle"
             @load="captureFullscreenImageSize"
           />
@@ -209,14 +209,14 @@ function syncSelectedPreview() {
 }
 
 const stageLabels: Record<PerlerProgressUpdate['stage'], string> = {
-  connect: '正在连接 Perler…',
+  connect: '正在准备本地生成…',
   prepare: '正在准备原图…',
   sample: '正在采样像素…',
   select: '正在选择拼豆颜色…',
   map: '正在映射拼豆色号…',
   cleanup: '正在清理零碎色块…',
   background: '正在识别并移除背景…',
-  refine: '正在等待 Perler 处理结果…',
+  refine: '正在精简颜色与清理边缘…',
   render: '正在渲染三种拼豆输出…',
 }
 
@@ -228,7 +228,7 @@ const progressPercent = computed(() => {
 })
 const progressDetail = computed(() => {
   const progress = props.progress
-  if (!progress || progress.stage === 'connect') return '首次连接最长等待 15 秒，整个任务最长等待 5 分钟。'
+  if (!progress || progress.stage === 'connect') return '图片只在本机处理；完成后可选择在 Perler 中继续细调。'
   return `${progress.completed} / ${progress.total}`
 })
 
