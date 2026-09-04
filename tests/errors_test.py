@@ -88,6 +88,18 @@ def test_classifies_common_http_statuses():
     assert upstream.status == 502
 
 
+def test_classifies_image_safety_moderation_error():
+    error = classify_error(
+        "图片接口拒绝请求：Your request was rejected by the safety system。"
+        "（moderation_blocked）"
+    )
+
+    assert error.code == "CONTENT_SAFETY_BLOCKED"
+    assert error.retryable is False
+    assert error.status == 400
+    assert "原创角色" in error.suggestion
+
+
 def test_error_payload_keeps_compat_error_message():
     payload = error_payload(classify_error("HTTP 429: rate limit"))
 

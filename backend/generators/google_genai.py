@@ -333,6 +333,7 @@ class GoogleGenAIGenerator(ImageGeneratorBase):
         temperature: float = 1.0,
         model: str = "gemini-3-pro-image-preview",
         reference_image: Optional[bytes] = None,
+        direct_reference_prompt: bool = False,
         **kwargs
     ) -> bytes:
         """
@@ -369,7 +370,7 @@ class GoogleGenAIGenerator(ImageGeneratorBase):
                 )
             ))
             # 添加带参考说明的提示词
-            enhanced_prompt = f"""请参考上面这张图片的视觉风格（包括配色、排版风格、字体风格、装饰元素风格），生成一张风格一致的新图片。
+            enhanced_prompt = prompt if direct_reference_prompt else f"""请参考上面这张图片的视觉风格（包括配色、排版风格、字体风格、装饰元素风格），生成一张风格一致的新图片。
 
 新图片的内容要求：
 {prompt}

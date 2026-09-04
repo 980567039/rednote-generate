@@ -1,6 +1,7 @@
 """图片生成服务"""
 import logging
 import os
+import re
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,6 +35,47 @@ SYSTEMIC_ERROR_CODES = {
     "UPSTREAM_CONNECTION_CLOSED",
     "UPSTREAM_UNAVAILABLE",
 }
+
+CHARACTER_SHEET_ASPECT_RATIO = "1:1"
+CHARACTER_SHEET_IMAGE_SIZE = "1024x1024"
+
+
+# 角色合集图片会直接作为后续 Perler 转换的输入。通用图片提示词允许封面
+# 使用标题/副标题，这对普通社交媒体配图有帮助，却会让角色素材变成海报，
+# 也会把页面说明误画进图里。character_sheet 改用独立的无文字提示头并增加视觉约束；
+# 网格、色号和拼豆材质等施工规则仍由 Perler 负责，不能提前塞给图片模型。
+CHARACTER_SHEET_IMAGE_GUIDANCE = (
+    "\n\n【角色转换素材图专用要求｜优先执行】\n"
+    "这是一张供后续图案转换使用的 1:1 正方形、干净二维角色原图，不是海报、宣传卡片或文字排版图。"
+    "页面内容中的角色名、作品名、主题和说明只用于理解，"
+    "不要生成角色名字和描述文字，也不要把这些文字绘制到图片中。\n"
+    "画面只保留一个放大且容易识别的角色作为唯一视觉主体；优先采用上半身/胸像构图，"
+    "突出头部、脸部、发型和服装细节；也可以采用紧凑的 Q 版全身构图（大头、短身、四肢集中）。"
+    "不要使用细长的成人全身站立构图、远景人物或从头到脚留大块空白。角色居中且不裁切，"
+    "主体高度约占画布 85%–95%、宽度约占 75%–90%，边缘只留 5%–10% 的安全留白，不要加入其他角色。\n"
+    "背景必须简单、干净、低干扰：优先纯白或单一浅色背景和适量留白；不要场景背景、"
+    "复杂纹理、装饰贴纸、边框、拼贴、统计信息或无关道具，只保留角色必要的标志性道具。\n"
+    "禁止标题、字幕、标签、说明文字、对话框、数字、Logo、水印、伪文字和海报式排版；"
+    "即使通用模板或参考图中存在文字，本图也不要添加或复制任何文字。\n"
+    "保持参考图中的角色身份、发型、脸部、服饰、表情和主要配色；使用清晰轮廓和干净色块，"
+    "减少细碎噪点、杂色、过度阴影和高光。保持正常二维角色插画，不要预先绘制网格、"
+    "施工线、色号、颗粒、珠孔或 3D 塑料材质；后续转换由工具完成。"
+)
+
+
+# 通用 image_prompt.txt 为普通社交媒体封面设计，明确允许封面标题和副标题。
+# 角色素材图不能继续沿用这套文字策略，否则模型即使收到末尾的禁止文字规则，
+# 仍可能把角色名和作品名排到左上角。角色模式会先切换到这个纯素材提示头，
+# 再追加上面的视觉约束。
+CHARACTER_SHEET_PROMPT_HEADER = (
+    "生成一张 1:1 正方形的高质量二维角色素材图，只绘制一个放大的角色主体。"
+    "优先上半身/胸像细节，或使用紧凑的 Q 版全身构图；避免细长的成人全身站立构图。"
+    "角色主体需要尽量填满画布，以适配 104×104 和 200×200 方形拼豆图纸。"
+    "这不是海报、封面、宣传卡片或社交媒体文字排版图。"
+    "画面中不要出现任何角色名字、作品名、主题名或描述文字。"
+    "参考图中的文字、Logo 和排版也不要复制。"
+    "下面的角色信息仅用于模型识别和绘画，绝不能作为画面文字输出："
+)
 
 
 class ActiveGenerationError(RuntimeError):
@@ -118,6 +160,234 @@ class ImageService:
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
+    @staticmethod
+    def _is_character_sheet(content_mode: str = "", series_context: str = "") -> bool:
+        """识别角色合集模式，并兼容没有结构化模式字段的旧任务。
+
+        新请求的 ``content_mode`` 是权威来源；只有调用方完全没有传该字段
+        时，才检查历史上下文中的旧版中文标记。这样可以避免一个显式的
+        ``story`` 请求被陈旧上下文误路由到角色合集流程。
+        """
+        normalized = str(content_mode or "").strip().lower()
+        if normalized:
+            return normalized == "character_sheet"
+        return "内容方向：精细角色图" in (series_context or "")
+
+    @staticmethod
+    def _clean_character_sheet_page_content(page_content: str) -> str:
+        """移除旧版角色页遗留的拼豆布局提示，保留角色描述本身。
+
+        角色合集早期曾把完整的 78×78/104×104 施工图模板直接写进页面
+        内容。页面内容会被直接放进通用 ``image_prompt``，所以只在角色
+        合集模式清理这些历史规则；普通故事页和用户自己的角色描述不受
+        影响。清理策略优先截掉明确的生产规则段，再处理没有段落标题、把
+        身份描述和生产规则写在同一行的旧格式。
+        """
+        if not isinstance(page_content, str):
+            return page_content
+
+        cleaned = page_content.replace("\r\n", "\n").replace("\r", "\n")
+
+        # 这些标题之后全部是施工输出规则，不应再次进入通用图片模型。
+        # 找最早的标题，兼容旧记录把规则写在一个长段落中的情况。
+        production_markers = (
+            "【拼豆生产输出",
+            "【最重要：严格拼豆网格】",
+            "【严格拼豆网格】",
+            "【施工网格与色号】",
+            "【施工网格】",
+            "【网格显示】",
+            "【像素艺术要求】",
+            "【颜色】",
+            "【色号】",
+            "【构图】",
+            "【视觉目标】",
+            "【最终检查】",
+        )
+        marker_positions = [
+            cleaned.find(marker)
+            for marker in production_markers
+            if cleaned.find(marker) >= 0
+        ]
+        if marker_positions:
+            cleaned = cleaned[:min(marker_positions)]
+
+        # 旧版还可能没有上述标题，只在一行中追加“直接生成 104×104”。
+        # 保留生产短语之前的角色身份描述，丢弃后面的整句规则。
+        inline_production = re.compile(
+            r"(?:直接生成(?:最终)?|最终(?:图案|输出)必须(?:严格)?(?:按照)?|"
+            r"把角色重新\s*[“\"「『]?\s*设计\s*[”\"」』]?\s*为)\s*"
+            r"(?:\d+\s*[×xX]\s*\d+|像素艺术)",
+        )
+        legacy_fragments = (
+            "采用系列固定像素风与色板，单张 3:4 竖版构图；",
+            "采用系列固定像素风与色板，单张3:4竖版构图；",
+            "采用系列固定像素风与色板，单张 3:4 竖版构图。",
+            "采用系列固定像素风与色板，单张3:4竖版构图。",
+        )
+        lines = []
+        for raw_line in cleaned.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            for fragment in legacy_fragments:
+                line = line.replace(fragment, "")
+
+            match = inline_production.search(line)
+            if match:
+                line = line[:match.start()].rstrip(" ；;，,")
+
+            # 无标题的旧规则行通常包含尺寸和“格/网格/拼豆”关键词。
+            # 仅过滤这类行，避免误删“角色：…”等正常身份描述。
+            if re.search(r"\d+\s*[×xX]\s*\d+", line) and re.search(
+                r"(?:格子|网格|拼豆|像素|抗锯齿|渐变|半透明|3D|色号)",
+                line,
+                flags=re.IGNORECASE,
+            ):
+                continue
+            if re.search(
+                r"(?:严格拼豆网格|每个格子只能|每一格只能|颜色跨越格子|"
+                r"不允许半格|不允许出现圆形像素|真实拼豆颗粒|塑料拼豆材质|"
+                r"禁止 3:4 社交媒体构图)",
+                line,
+                flags=re.IGNORECASE,
+            ):
+                continue
+
+            # 删除残留的单独尺寸/统计数字，避免通用 prompt 再被尺寸带偏。
+            line = re.sub(r"\b(?:104|78)\s*[×xX]\s*(?:104|78)\b", "", line)
+            line = re.sub(r"\b(?:10816|6084)\b\s*个?(?:格子|格)?", "", line)
+
+            # 不要因为“像素”“渐变”“颜色”等普通描述词就丢掉角色身份。
+            # 只有明确是生产约束的句子才过滤；例如“粉紫渐变长发”是
+            # 有效角色特征，而“禁止渐变/每格一种颜色”才是旧施工规则。
+            is_identity_line = bool(re.match(r"^(?:角色|人物|作品)\s*[：:]", line))
+            is_production_constraint = re.search(
+                r"(?:严格拼豆网格|每个格子只能|每一格只能|颜色跨越格子|"
+                r"不允许(?:出现)?(?:半格|圆形像素|真实拼豆颗粒|渐变|抗锯齿|模糊|"
+                r"半透明|3D(?:效果)?|塑料(?:材质)?|珠孔)|"
+                r"禁止(?:任何)?(?:渐变|抗锯齿|模糊|半透明|3D(?:效果)?|塑料(?:材质)?|"
+                r"网格线|色号文字)|"
+                r"(?:拼豆施工图|施工网格|施工模板|网格线|色号|珠孔|"
+                r"颜色跨越格子))",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if not is_identity_line and is_production_constraint:
+                continue
+            line = line.strip(" ；;，,")
+            if line:
+                lines.append(line)
+
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _character_sheet_identity_content(page_content: str) -> str:
+        """整理角色身份输入，避免把页面标签和主题说明当成画面文案。
+
+        角色名和外观描述仍需传给图片模型，才能确定要画谁；但“封面”“所属主题”
+        以及页面制作说明会明显诱导模型生成左上角标题。因此这里只保留角色身份和
+        用户/模板提供的外观信息，并把它们放进明确的“不可显示”区块。
+        """
+        if not isinstance(page_content, str):
+            return "角色身份：未命名角色"
+
+        content = ImageService._clean_character_sheet_page_content(page_content)
+        lines = []
+        for raw_line in content.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            # 页面类型是工作流元数据，不是角色视觉信息。
+            if re.fullmatch(r"\[[^\]]+\]", line):
+                continue
+            if re.match(r"^所属主题\s*[：:]", line):
+                continue
+            if re.match(r"^(?:本页只展示|不讲连续故事|不与其他角色合并|不添加大段文字)", line):
+                continue
+            line = re.sub(r"^精细角色设定图\s*[：:]\s*", "角色身份：", line)
+            lines.append(line)
+
+        return "\n".join(lines).strip() or "角色身份：未命名角色"
+
+    @staticmethod
+    def _build_character_sheet_prompt(raw_prompt: str, page_content: str) -> str:
+        """用纯素材提示替换通用封面的文字策略。
+
+        保留自定义短模板的开头，兼容第三方图片服务商的自定义 prompt；对项目自带
+        的完整/短模板则不保留“封面可放标题”等互相冲突的规则，只留下角色身份输入。
+        """
+        raw_prompt = str(raw_prompt or "").strip()
+        generic_markers = (
+            "本页素材（用于理解主题、事实和视觉场景；并非都要写进图片）",
+            "本页素材（用于理解，不要逐字照抄到图片）",
+            "封面最多保留主标题",
+            "封面：主标题",
+            "文字策略：",
+        )
+        if any(marker in raw_prompt for marker in generic_markers):
+            prompt_header = CHARACTER_SHEET_PROMPT_HEADER
+        else:
+            # 自定义模板往往只有“页面：{page_content}”等上下文，没有通用封面规则；
+            # 保留其内容可避免破坏现有服务商配置和调用方约定。
+            prompt_header = raw_prompt
+            # 即使自定义模板没有通用文字策略，也不要把页面元数据原样送给
+            # 模型，尤其是“所属主题”这类最容易被排成左上角标题的字段。页面
+            # 内容会在下面的“仅供识别”区块中重新提供，避免同一角色名在提示头
+            # 和身份区各出现一次。
+            prompt_header = re.sub(
+                r"(?m)^\s*(?:\[[^\]]+\]|所属主题\s*[：:].*|"
+                r"本页只展示.*|不讲连续故事.*|不与其他角色合并.*|不添加大段文字.*|"
+                r"(?:主题|创作主题|页面|类型)\s*[：:].*)\s*$",
+                "",
+                prompt_header,
+            ).strip()
+            if not prompt_header:
+                prompt_header = CHARACTER_SHEET_PROMPT_HEADER
+
+        identity = ImageService._character_sheet_identity_content(page_content)
+        identity_block = (
+            "\n\n【仅供识别的角色信息｜不可显示】\n"
+            "---\n"
+            f"{identity}\n"
+            "---\n"
+            "请只将上述信息用于确定角色外观。不要复制、排版或绘制其中任何名字、主题、"
+            "标签、说明或其他文字；左上角、右上角、边缘和背景都必须保持无文字。"
+        )
+        return f"{prompt_header}{identity_block}"
+
+    @staticmethod
+    def _character_identity_from_context(series_context: str) -> str:
+        """从系列上下文提取角色身份信息，不带回施工/排版规则。"""
+        if not isinstance(series_context, str) or not series_context.strip():
+            return ""
+
+        identity_parts = []
+        for raw_line in series_context.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = raw_line.strip()
+            match = re.match(r"^角色设定\s*[：:]\s*(.*)$", line)
+            if not match:
+                continue
+            value = match.group(1).strip()
+            # 角色模板早期把生产约束和身份描述写在同一行；先去掉
+            # 明确的网格/材质尾句，再进行通用角色页清理。
+            value = re.split(
+                r"(?:所有轮廓与细节|每个逻辑格|每一格|严格按完整正方形格|"
+                r"不依赖复杂光影|禁止珠孔|禁止渐变)",
+                value,
+                maxsplit=1,
+            )[0]
+            value = ImageService._clean_character_sheet_page_content(value)
+            if value:
+                identity_parts.append(value)
+
+        # 去重但保持模板中的原始顺序，避免同一角色设定重复注入 prompt。
+        unique = []
+        for value in identity_parts:
+            if value not in unique:
+                unique.append(value)
+        return "；".join(unique)
+
     def _ensure_runtime_state(self):
         """兼容测试中通过 __new__ 构造的轻量服务实例。"""
         if not hasattr(self, "_task_states"):
@@ -147,6 +417,11 @@ class ImageService:
             "updated_at": state.get("updated_at"),
             "finished_at": state.get("finished_at"),
             "has_cover": state.get("cover_image") is not None,
+            "content_mode": state.get("content_mode"),
+            "series_id": state.get("series_id"),
+            "series_template_id": state.get("series_template_id"),
+            "series_project_id": state.get("series_project_id"),
+            "series_item_id": state.get("series_item_id"),
         }
 
     def prepare_generation(
@@ -155,6 +430,14 @@ class ImageService:
         task_id: Optional[str] = None,
         record_id: Optional[str] = None,
         force: bool = False,
+        series_context: str = "",
+        series_id: Optional[str] = None,
+        series_template_id: Optional[str] = None,
+        series_project_id: Optional[str] = None,
+        series_item_id: Optional[str] = None,
+        series_template: Optional[Dict[str, Any]] = None,
+        content_mode: str = "",
+        **_: Any,
     ) -> Dict[str, Any]:
         """原子预留任务 ID，并在任何上游调用前绑定历史记录。"""
         self._ensure_runtime_state()
@@ -220,6 +503,12 @@ class ImageService:
                 "full_outline": "",
                 "user_images": None,
                 "user_topic": "",
+                "series_context": series_context or "",
+                "content_mode": content_mode or "",
+                "series_id": series_id,
+                "series_template_id": series_template_id,
+                "series_project_id": series_project_id,
+                "series_item_id": series_item_id,
                 "error": None,
                 "created_at": now,
                 "started_at": None,
@@ -311,6 +600,8 @@ class ImageService:
         total_count: Optional[int] = None,
         task_dir: Optional[str] = None,
         phase: str = "content",
+        series_context: str = "",
+        content_mode: str = "",
     ) -> Tuple[int, bool, Optional[str], Optional[str]]:
         """
         生成单张图片（带自动重试）
@@ -330,6 +621,23 @@ class ImageService:
         index = page["index"]
         page_type = page["type"]
         page_content = page["content"]
+        # 角色合集使用独立的纯素材提示词，避免通用封面规则诱导模型生成文字。
+        # 过去这里把角色页误判为“拼豆施工图”，直接追加了网格和材质约束，
+        # 导致模型输出混杂颜色/网格倾向的素材。现在只固定正方形画布，实际网格
+        # 转换仍交给 Perler。显式模式优先，旧任务没有 content_mode 时再用标记兜底。
+        is_character_sheet = self._is_character_sheet(content_mode, series_context)
+        if is_character_sheet:
+            page_content = self._clean_character_sheet_page_content(page_content)
+            identity = self._character_identity_from_context(series_context)
+            if identity and identity not in page_content:
+                page_content = f"{page_content}\n角色身份补充：{identity}" if page_content else f"角色身份补充：{identity}"
+        clean_pattern_source = (
+            not is_character_sheet
+            and (
+                "精细角色设定图" in page_content
+                or page_type == "pattern_source"
+            )
+        )
 
         try:
             if task_dir is None:
@@ -337,33 +645,76 @@ class ImageService:
             self._mark_attempt(task_id, index, phase, retry_count + 1)
             logger.debug(f"生成图片 [{index}]: type={page_type}")
 
-            # 根据配置选择模板（短 prompt 或完整 prompt）
+            # 根据配置选择模板（短 prompt 或完整 prompt）。角色素材图会在
+            # 格式化后替换掉通用模板的封面文字策略，避免模型把角色名排成标题。
             if self.use_short_prompt and self.prompt_template_short:
                 # 短 prompt 模式：只包含页面类型和内容
-                prompt = self.prompt_template_short.format(
+                raw_prompt = self.prompt_template_short.format(
                     page_content=page_content,
                     page_type=page_type
                 )
-                logger.debug(f"  使用短 prompt 模式 ({len(prompt)} 字符)")
+                logger.debug(f"  使用短 prompt 模式 ({len(raw_prompt)} 字符)")
             else:
                 # 完整 prompt 模式：包含大纲和用户需求
-                prompt = self.prompt_template.format(
+                raw_prompt = self.prompt_template.format(
                     page_content=page_content,
                     page_type=page_type,
                     full_outline=full_outline,
                     user_topic=user_topic if user_topic else "未提供"
                 )
+            prompt = (
+                self._build_character_sheet_prompt(raw_prompt, page_content)
+                if is_character_sheet
+                else raw_prompt
+            )
+
+            # character_sheet 图片只保留角色身份输入和专用视觉规则；系列上下文仍会
+            # 传给文案/大纲服务，但不把整套系列规则直接灌进图片模型。
+            prompt_series_context = series_context
+            # 显式故事模式优先于旧记录中的角色标记；不要把冲突的旧
+            # 角色规则再次附加到通用图片提示词。
+            if (
+                str(content_mode or "").strip().lower() == "story"
+                and "内容方向：精细角色图" in prompt_series_context
+            ):
+                prompt_series_context = ""
+            if prompt_series_context and not is_character_sheet:
+                prompt += (
+                    "\n\n" + prompt_series_context +
+                    "\n【系列图片硬约束】必须保持系列画风、色板、镜头语言和角色外观；"
+                    "禁止改变系列页面数量与构图规则。文字只作辅助信息，禁止密集文字和禁用元素。"
+                )
+            if clean_pattern_source:
+                prompt += (
+                    "\n\n【拼豆源图硬约束】这张图将被转换为拼豆图纸，必须只保留一个清晰主体；"
+                    "禁止任何文字、标题、字幕、数字、边框、装饰贴纸、拼贴、统计信息和水印；"
+                    "主体占画面主要区域，使用有限色、大色块、清晰外轮廓和干净背景，避免细碎噪点、"
+                    "渐变纹理和多个独立小物件。画面优先输出适合 104×104 网格采样的高分辨率正方形源图。"
+                )
+            if is_character_sheet:
+                # 追加专用无文字约束，避免角色名称、作品名或页面说明被模型排成海报文字。
+                prompt += CHARACTER_SHEET_IMAGE_GUIDANCE
 
             # 调用生成器生成图片。所有路径共用 limiter，避免批量和重试打爆上游。
             with self.rate_limiter.acquire():
                 if self.provider_config.get('type') == 'google_genai':
                     logger.debug(f"  使用 Google GenAI 生成器")
+                    google_reference = reference_image or (user_images[0] if user_images else None)
                     image_data = self.generator.generate_image(
                         prompt=prompt,
-                        aspect_ratio=self.provider_config.get('default_aspect_ratio', '3:4'),
+                        aspect_ratio=(
+                            CHARACTER_SHEET_ASPECT_RATIO
+                            if is_character_sheet
+                            else self.provider_config.get('pattern_source_aspect_ratio', '1:1')
+                            if clean_pattern_source
+                            else self.provider_config.get('default_aspect_ratio', '3:4')
+                        ),
                         temperature=self.provider_config.get('temperature', 1.0),
                         model=self.provider_config.get('model', 'gemini-3-pro-image-preview'),
-                        reference_image=reference_image,
+                        reference_image=google_reference,
+                        # 参考图包装器默认会强调“排版/字体风格”；角色素材图必须
+                        # 只继承人物视觉，不要让参考图中的文字布局被复制。
+                        direct_reference_prompt=is_character_sheet,
                     )
                 elif self.provider_config.get('type') == 'image_api':
                     logger.debug(f"  使用 Image API 生成器")
@@ -377,16 +728,30 @@ class ImageService:
 
                     image_data = self.generator.generate_image(
                         prompt=prompt,
-                        aspect_ratio=self.provider_config.get('default_aspect_ratio', '3:4'),
+                        aspect_ratio=(
+                            CHARACTER_SHEET_ASPECT_RATIO
+                            if is_character_sheet
+                            else self.provider_config.get('pattern_source_aspect_ratio', '1:1')
+                            if clean_pattern_source
+                            else self.provider_config.get('default_aspect_ratio', '3:4')
+                        ),
                         temperature=self.provider_config.get('temperature', 1.0),
                         model=self.provider_config.get('model', 'nano-banana-2'),
                         reference_images=reference_images if reference_images else None,
+                        # 同上：避免参考图增强提示再次引导模型生成标题或标签。
+                        direct_reference_prompt=is_character_sheet,
                     )
                 else:
                     logger.debug(f"  使用 OpenAI 兼容生成器")
                     image_data = self.generator.generate_image(
                         prompt=prompt,
-                        size=self.provider_config.get('default_size', '1024x1024'),
+                        # OpenAI-compatible providers receive dimensions instead of
+                        # aspect_ratio; force a square canvas for bead-board output.
+                        size=(
+                            CHARACTER_SHEET_IMAGE_SIZE
+                            if is_character_sheet
+                            else self.provider_config.get('default_size', '1024x1024')
+                        ),
                         model=self.provider_config.get('model'),
                         quality=self.provider_config.get('quality', 'standard'),
                     )
@@ -423,10 +788,26 @@ class ImageService:
         force: bool = False,
         prepared: bool = False,
         cached: bool = False,
+        series_context: str = "",
+        series_id: Optional[str] = None,
+        series_template_id: Optional[str] = None,
+        series_project_id: Optional[str] = None,
+        series_item_id: Optional[str] = None,
+        series_template: Optional[Dict[str, Any]] = None,
+        content_mode: str = "",
+        **_: Any,
     ) -> Generator[Dict[str, Any], None, None]:
         """安全包装生成流，确保断流和内部异常也写入任务终态。"""
         if not prepared:
-            reservation = self.prepare_generation(pages, task_id, record_id, force)
+            reservation = self.prepare_generation(
+                pages, task_id, record_id, force,
+                series_context=series_context,
+                series_id=series_id,
+                series_template_id=series_template_id,
+                series_project_id=series_project_id,
+                series_item_id=series_item_id,
+                content_mode=content_mode,
+            )
             task_id = reservation["task_id"]
             cached = reservation["cached"]
             prepared = True
@@ -442,6 +823,12 @@ class ImageService:
                 force,
                 prepared,
                 cached,
+                series_context,
+                series_id,
+                series_template_id,
+                series_project_id,
+                series_item_id,
+                content_mode,
             )
         except GeneratorExit:
             self._settle_aborted_task(task_id, record_id, "interrupted", "客户端连接已中断")
@@ -510,10 +897,30 @@ class ImageService:
         force: bool = False,
         prepared: bool = False,
         cached: bool = False,
+        series_context: str = "",
+        series_id: Optional[str] = None,
+        series_template_id: Optional[str] = None,
+        series_project_id: Optional[str] = None,
+        series_item_id: Optional[str] = None,
+        content_mode: str = "",
     ) -> Generator[Dict[str, Any], None, None]:
         """生成图片，并用真实任务状态驱动 SSE。"""
+        if task_id in self._task_states:
+            task_state = self._task_states[task_id]
+            if not series_context:
+                series_context = task_state.get("series_context", "")
+            if not content_mode:
+                content_mode = task_state.get("content_mode", "")
         if not prepared:
-            reservation = self.prepare_generation(pages, task_id, record_id, force)
+            reservation = self.prepare_generation(
+                pages, task_id, record_id, force,
+                series_context=series_context,
+                series_id=series_id,
+                series_template_id=series_template_id,
+                series_project_id=series_project_id,
+                series_item_id=series_item_id,
+                content_mode=content_mode,
+            )
             task_id = reservation["task_id"]
             cached = reservation["cached"]
 
@@ -549,6 +956,12 @@ class ImageService:
             full_outline=full_outline,
             user_images=compressed_user_images,
             user_topic=user_topic,
+            series_context=series_context,
+            series_id=series_id,
+            series_template_id=series_template_id,
+            series_project_id=series_project_id,
+            series_item_id=series_item_id,
+            content_mode=content_mode,
         )
         logger.info("开始图片生成任务: task_id=%s, pages=%s", task_id, total)
 
@@ -588,6 +1001,8 @@ class ImageService:
                 total_count=total,
                 task_dir=task_dir,
                 phase="cover",
+                series_context=series_context,
+                content_mode=content_mode,
             )
             index, success, filename, error = result
             if success:
@@ -618,6 +1033,7 @@ class ImageService:
                         "index": index,
                         "status": "error",
                         "message": error,
+                        "error": app_error.to_dict(),
                         "retryable": app_error.retryable,
                         "phase": "cover",
                     },
@@ -655,10 +1071,14 @@ class ImageService:
             }
 
             def generate_page(page: Dict):
+                # 角色图模式的每一页都代表一个独立角色，不能把第一张角色图作为后续角色的
+                # 参考图，否则模型容易复制成“全员合照”或让后续角色外观被首个角色带偏。
+                is_character_sheet = self._is_character_sheet(content_mode, series_context)
+                page_reference = None if is_character_sheet else cover_image_data
                 return self._generate_single_image(
                     page,
                     task_id,
-                    cover_image_data,
+                    page_reference,
                     0,
                     full_outline,
                     compressed_user_images,
@@ -667,6 +1087,8 @@ class ImageService:
                     total,
                     task_dir,
                     "content",
+                    series_context,
+                    content_mode,
                 )
 
             if self.worker_count > 1:
@@ -724,6 +1146,7 @@ class ImageService:
                 "completed": completed,
                 "failed": len(failed_indices),
                 "failed_indices": failed_indices,
+                "failed_errors": dict(state.get("failed") or {}),
             },
         }
 
@@ -762,6 +1185,7 @@ class ImageService:
                 "index": index,
                 "status": "error",
                 "message": error,
+                "error": app_error.to_dict(),
                 "retryable": app_error.retryable,
                 "phase": "content",
             },
@@ -835,7 +1259,9 @@ class ImageService:
         full_outline: str = "",
         user_topic: str = "",
         record_id: Optional[str] = None,
-        revision_request: str = ""
+        revision_request: str = "",
+        series_context: str = "",
+        content_mode: str = "",
     ) -> Dict[str, Any]:
         """
         重试生成单张图片
@@ -867,9 +1293,18 @@ class ImageService:
             if not user_topic:
                 user_topic = task_state.get("user_topic", "")
             user_images = task_state.get("user_images")
+            if not series_context:
+                series_context = task_state.get("series_context", "")
+            if not content_mode:
+                content_mode = task_state.get("content_mode", "")
+
+        is_character_sheet = self._is_character_sheet(content_mode, series_context)
+        if is_character_sheet:
+            # 角色合集各页独立生图，不沿用封面作为参考图。
+            reference_image = None
 
         # 如果任务状态中没有封面图，尝试从文件系统加载
-        if use_reference and reference_image is None:
+        if use_reference and not is_character_sheet and reference_image is None:
             cover_path = os.path.join(task_dir, "0.png")
             if os.path.exists(cover_path):
                 with open(cover_path, "rb") as f:
@@ -902,6 +1337,8 @@ class ImageService:
             total_count,
             task_dir,
             "retry",
+            series_context,
+            content_mode,
         )
 
         if success:
@@ -931,7 +1368,12 @@ class ImageService:
         self,
         task_id: str,
         pages: List[Dict],
-        record_id: Optional[str] = None
+        record_id: Optional[str] = None,
+        series_context: str = "",
+        full_outline: str = "",
+        user_topic: str = "",
+        user_images: Optional[List[bytes]] = None,
+        content_mode: str = "",
     ) -> Generator[Dict[str, Any], None, None]:
         """
         批量重试失败的图片
@@ -949,15 +1391,23 @@ class ImageService:
 
         # 获取参考图和上下文
         reference_image = None
-        user_images = None
-        user_topic = ""
+        # 保留调用方传入的参考图和主题；服务重启后内存状态可能不存在，
+        # 此时系列重试仍应使用条目快照提供的角色参考图。
         if task_id in self._task_states:
             task_state = self._task_states[task_id]
             reference_image = task_state.get("cover_image")
-            user_images = task_state.get("user_images")
-            user_topic = task_state.get("user_topic", "")
+            user_images = task_state.get("user_images") or user_images
+            user_topic = task_state.get("user_topic") or user_topic
+            if not series_context:
+                series_context = task_state.get("series_context", "")
+            if not content_mode:
+                content_mode = task_state.get("content_mode", "")
 
-        if reference_image is None:
+        is_character_sheet = self._is_character_sheet(content_mode, series_context)
+        if is_character_sheet:
+            reference_image = None
+
+        if not is_character_sheet and reference_image is None:
             cover_path = os.path.join(self.history_root_dir, task_id, "0.png")
             if os.path.exists(cover_path):
                 with open(cover_path, "rb") as f:
@@ -976,9 +1426,9 @@ class ImageService:
         }
 
         # 从任务状态中获取完整大纲
-        full_outline = ""
+        full_outline = full_outline or ""
         if task_id in self._task_states:
-            full_outline = self._task_states[task_id].get("full_outline", "")
+            full_outline = self._task_states[task_id].get("full_outline") or full_outline
         total_count = None
         if task_id in self._task_states:
             total_count = len(self._task_states[task_id].get("pages", []))
@@ -1006,12 +1456,19 @@ class ImageService:
                 }
 
             failed_count += 1
+            if record_id:
+                self.history_service.update_record(
+                    record_id,
+                    images={"errors": {str(index): error or "该页图片生成失败"}},
+                )
+            app_error = ensure_app_error(error, context={"task_id": task_id, "phase": "retry"})
             return {
                 "event": "error",
                 "data": {
                     "index": index,
                     "status": "error",
                     "message": error,
+                    "error": app_error.to_dict(),
                     "retryable": True
                 }
             }
@@ -1032,6 +1489,8 @@ class ImageService:
                         total_count,
                         task_dir,
                         "retry",
+                        series_context,
+                        content_mode,
                     ): page
                     for page in pages
                 }
@@ -1065,6 +1524,8 @@ class ImageService:
                     total_count,
                     task_dir,
                     "retry",
+                    series_context,
+                    content_mode,
                 )
                 yield handle_result(page, result)
 
@@ -1082,6 +1543,16 @@ class ImageService:
     def _settle_retry_task(self, task_id: str, record_id: Optional[str]):
         """重试结束后恢复可靠终态，避免任务永久停留在 running。"""
         if task_id not in self._task_states:
+            # 服务重启后内存任务状态不存在，但历史记录仍可根据已落盘图片收敛。
+            if record_id:
+                record = self.history_service.get_record(record_id, sync_images=True)
+                if record:
+                    images = record.get("images") or {}
+                    total = len(record.get("outline", {}).get("pages", []))
+                    generated = images.get("generated") or []
+                    status = HistoryImageMerger.compute_status(generated, total)
+                    history_status = "completed" if status == "completed" else ("partial" if status == "partial" else "error")
+                    self.history_service.finish_generation(record_id, task_id, history_status)
             return
         state = self._task_states[task_id]
         completed = len(state.get("generated") or {})
@@ -1110,7 +1581,9 @@ class ImageService:
         full_outline: str = "",
         user_topic: str = "",
         record_id: Optional[str] = None,
-        revision_request: str = ""
+        revision_request: str = "",
+        series_context: str = "",
+        content_mode: str = "",
     ) -> Dict[str, Any]:
         """
         重新生成图片（用户手动触发，即使成功的也可以重新生成）
@@ -1131,7 +1604,9 @@ class ImageService:
             full_outline=full_outline,
             user_topic=user_topic,
             record_id=record_id,
-            revision_request=revision_request
+            revision_request=revision_request,
+            series_context=series_context,
+            content_mode=content_mode,
         )
 
     def get_image_path(self, task_id: str, filename: str) -> str:

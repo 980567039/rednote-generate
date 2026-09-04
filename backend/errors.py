@@ -133,6 +133,24 @@ def classify_error(error: Union[Exception, str], context: Optional[Dict[str, Any
             diagnostics=diagnostics,
         )
 
+    if any(keyword in text for keyword in [
+        "moderation_blocked",
+        "safety system",
+        "safety policy",
+        "content policy",
+        "content_policy_violation",
+        "image_generation_user_error",
+    ]):
+        return AppError(
+            code="CONTENT_SAFETY_BLOCKED",
+            title="图片内容被安全策略拦截",
+            detail=upstream_message or "图片服务商拒绝了当前图片内容。",
+            suggestion="这不是网络或 Base URL 问题，重复补图通常仍会失败；请改为原创角色和场景，或移除可能触发限制的第三方 IP、敏感元素后重试。",
+            status=400,
+            retryable=False,
+            diagnostics=diagnostics,
+        )
+
     if status in (400, 415) and (
         "json" in text
         or "unsupported media type" in text

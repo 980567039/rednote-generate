@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 from flask import Flask, send_from_directory
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 from backend.config import Config
 from backend.routes import register_routes
 
@@ -54,12 +55,15 @@ def create_app():
         app = Flask(__name__)
 
     app.config.from_object(Config)
+    # 生产环境由 Caddy 终止 HTTPS；仅信任前置的一层反向代理头。
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
     CORS(app, resources={
         r"/api/*": {
-            "origins": Config.CORS_ORIGINS,
+            "origins": app.config['CORS_ORIGINS'],
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
             "allow_headers": ["Content-Type"],
+            "supports_credentials": True,
         }
     })
 

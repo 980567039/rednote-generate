@@ -2,6 +2,85 @@ import axios from 'axios'
 import type { AppError } from '../utils/errors'
 
 export const API_BASE_URL = '/api'
+export const AUTH_UNAUTHORIZED_EVENT = 'redink:auth-unauthorized'
+
+export class ApiRequestError extends Error {
+  status: number
+  code?: string
+
+  constructor(message: string, status: number, code?: string) {
+    super(message)
+    this.name = 'ApiRequestError'
+    this.status = status
+    this.code = code
+  }
+}
+
+axios.defaults.withCredentials = true
+axios.interceptors.response.use(
+  response => response,
+  error => {
+    if (
+      axios.isAxiosError(error)
+      && error.response?.status === 401
+      && typeof window !== 'undefined'
+      && !String(error.config?.url || '').includes('/auth/')
+    ) {
+      window.dispatchEvent(new Event(AUTH_UNAUTHORIZED_EVENT))
+    }
+    return Promise.reject(error)
+  }
+)
+
+export async function apiFetch(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  options: { handleUnauthorized?: boolean } = {}
+) {
+  const response = await fetch(input, {
+    ...init,
+    credentials: init?.credentials ?? 'same-origin'
+  })
+  if (
+    response.status === 401
+    && options.handleUnauthorized !== false
+    && typeof window !== 'undefined'
+  ) {
+    window.dispatchEvent(new Event(AUTH_UNAUTHORIZED_EVENT))
+  }
+  return response
+}
+
+export async function responseError(response: Response, fallback: string): Promise<ApiRequestError> {
+  try {
+    const body = await response.clone().json() as {
+      error?: unknown
+      message?: unknown
+      error_message?: unknown
+      code?: unknown
+    }
+    const structured = body.error && typeof body.error === 'object'
+      ? body.error as { detail?: unknown; title?: unknown; code?: unknown }
+      : null
+    const message = [
+      structured?.detail,
+      body.error,
+      body.message,
+      body.error_message,
+      structured?.title,
+    ].find(value => typeof value === 'string' && value.trim())
+    const code = typeof body.code === 'string'
+      ? body.code
+      : typeof structured?.code === 'string' ? structured.code : undefined
+    return new ApiRequestError(
+      typeof message === 'string' ? message : fallback,
+      response.status,
+      code
+    )
+  } catch {
+    return new ApiRequestError(fallback, response.status)
+  }
+}
 
 export function getApiErrorPayload(error: unknown, fallback: string): {
   error: AppError | string
@@ -21,9 +100,15 @@ export function getApiErrorPayload(error: unknown, fallback: string): {
       }
     }
     const data = error.response.data || {}
-    const message = data.error_message || fallback
+    const isObjectPayload = typeof data === 'object'
+    const status = error.response.status
+    const message = isObjectPayload && data.error_message
+      ? data.error_message
+      : status === 405
+        ? `接口请求方法不匹配（HTTP ${status}），后端可能尚未加载最新路由`
+        : fallback
     return {
-      error: data.error || message,
+      error: isObjectPayload && data.error ? data.error : message,
       error_message: message
     }
   }

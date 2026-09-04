@@ -3,8 +3,31 @@ import {
   createHistory,
   getHistory,
   getImageUrl,
-  type HistoryDetail
+  type HistoryDetail,
+  type SeriesRequestContext
 } from '../api'
+import { formatErrorMessage } from '../utils/errors'
+
+export function seriesContextFromHistory(
+  record: HistoryDetail,
+  overrides: SeriesRequestContext = {}
+): SeriesRequestContext {
+  const values: SeriesRequestContext = {
+    series_id: record.series_id || undefined,
+    series_template_id: record.series_template_id || undefined,
+    series_project_id: record.series_project_id || record.series_id || undefined,
+    series_item_id: record.series_item_id || undefined,
+    series_item_index: record.series_item_index ?? undefined,
+    series_item_title: record.series_item_title || undefined,
+    content_mode: record.series_content_mode === 'character_sheet' || record.series_content_mode === 'story'
+      ? record.series_content_mode
+      : undefined,
+    ...overrides
+  }
+  return Object.fromEntries(
+    Object.entries(values).filter(([, value]) => value !== undefined && value !== null && value !== '')
+  ) as SeriesRequestContext
+}
 
 export function useGenerationRestore() {
   const store = useGeneratorStore()
@@ -24,10 +47,19 @@ export function useGenerationRestore() {
 
     const images: GeneratedImage[] = pages.map((page, idx) => {
       const filename = generated[page.index] || generated[idx] || ''
+      const imageError = record.images.errors?.[String(page.index)] ?? record.images.errors?.[String(idx)]
+      const outputs = page.pattern?.outputs
       return {
         index: page.index,
         url: filename && taskId ? getImageUrl(taskId, filename) : '',
+        ...(taskId && outputs ? {
+          patternAssets: {
+            ...(outputs.beads ? { beads: getImageUrl(taskId, outputs.beads, false) } : {}),
+            ...(outputs.ironed ? { ironed: getImageUrl(taskId, outputs.ironed, false) } : {}),
+          },
+        } : {}),
         status: filename ? 'done' : 'error',
+        error: filename ? undefined : (imageError ? formatErrorMessage(imageError, '图片生成失败') : '原始失败原因未保存，点击补全后会显示新的实时错误。'),
         retryable: !filename
       }
     })
@@ -35,6 +67,7 @@ export function useGenerationRestore() {
       topic: record.title,
       outline: record.outline,
       recordId: record.id,
+      seriesContext: seriesContextFromHistory(record),
       taskId,
       images,
       progress: {
@@ -67,7 +100,7 @@ export function useGenerationRestore() {
       const result = await createHistory(store.topic, {
         raw: store.outline.raw,
         pages: store.outline.pages
-      })
+      }, undefined, store.seriesContext)
       if (result.success && result.record_id) {
         store.setRecordId(result.record_id)
         console.log('兜底创建历史记录成功:', store.recordId)

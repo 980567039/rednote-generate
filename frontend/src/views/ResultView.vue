@@ -15,6 +15,15 @@
             一键下载
           </button>
           <button
+            v-if="hasFailedImages"
+            class="btn btn-primary"
+            type="button"
+            :disabled="isRetrying"
+            @click="retryAllFailed"
+          >
+            {{ isRetrying ? '补全中…' : `一键补全失败图片（${failedCount}）` }}
+          </button>
+          <button
             class="btn btn-secondary publish-button"
             type="button"
             :disabled="!canPublish"
@@ -36,13 +45,31 @@
       @dismiss="error = null"
     />
 
+    <section v-if="hasFailedImages" class="result-failure-panel" aria-live="polite">
+      <div class="result-failure-heading">
+        <div>
+          <strong>{{ failedCount }} 张图片未生成</strong>
+          <p>成功图片会保留，补全操作只会重试缺失页面。</p>
+        </div>
+        <button class="btn btn-primary small-btn" type="button" :disabled="isRetrying" @click="retryAllFailed">
+          {{ isRetrying ? '补全中…' : '一键补全失败图片' }}
+        </button>
+      </div>
+      <ul class="result-failure-list">
+        <li v-for="image in failedImages" :key="`failed-${image.index}`">
+          <span>第 {{ image.index + 1 }} 页</span>
+          <span>{{ image.error || '原始失败原因未保存，点击补全后会显示新的实时错误。' }}</span>
+        </li>
+      </ul>
+    </section>
+
     <div class="card">
       <div class="grid-cols-4">
         <div v-for="image in store.images" :key="image.index" class="image-card group">
           <!-- Image Area -->
           <div
             v-if="image.url"
-            style="position: relative; aspect-ratio: 3/4; overflow: hidden; cursor: pointer;"
+            :style="{ position: 'relative', aspectRatio: isCharacterSheet ? '1 / 1' : '3 / 4', overflow: 'hidden', cursor: 'pointer' }"
             @click="viewImage(image.url)"
           >
             <img
@@ -72,7 +99,29 @@
                 </svg>
                 重新生成
               </button>
+              <button
+                class="hover-action-btn danger-action-btn"
+                type="button"
+                :disabled="deletingIndex === image.index"
+                @click.stop="deleteResultPage(image)"
+              >
+                {{ deletingIndex === image.index ? '删除中…' : (isPatternImage(image) ? '删除图纸' : '删除图片') }}
+              </button>
+              <button
+                v-if="canCreatePattern(image)"
+                class="hover-action-btn"
+                type="button"
+                :disabled="patternModalVisible || patternGeneratingIndex !== null"
+                @click.stop="generatePattern(image)"
+              >
+                {{ patternGeneratingIndex === image.index ? '生成图纸中…' : '生成拼豆图纸' }}
+              </button>
             </div>
+          </div>
+          <div v-else class="result-missing-image">
+            <span class="result-missing-icon">!</span>
+            <strong>第 {{ image.index + 1 }} 页生成失败</strong>
+            <p>{{ image.error || '原始失败原因未保存，点击上方按钮补全。' }}</p>
           </div>
 
           <!-- Action Bar -->
@@ -83,9 +132,42 @@
                 style="border: none; background: none; color: var(--text-sub); cursor: pointer; display: flex; align-items: center;"
                 title="重新生成此图"
                 @click="openRegenerateDialog(image)"
-                :disabled="regeneratingIndex === image.index"
+                :disabled="regeneratingIndex === image.index || isPatternImage(image)"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+              </button>
+              <button
+                style="border: none; background: none; color: var(--primary-active); cursor: pointer; font-size: 12px;"
+                type="button"
+                :disabled="deletingIndex === image.index"
+                @click="deleteResultPage(image)"
+              >
+                {{ deletingIndex === image.index ? '删除中…' : (isPatternImage(image) ? '删除图纸' : '删除图片') }}
+              </button>
+              <button
+                v-if="canCreatePattern(image)"
+                style="border: none; background: none; color: var(--primary); cursor: pointer; font-size: 12px;"
+                type="button"
+                :disabled="patternModalVisible || patternGeneratingIndex !== null"
+                @click="generatePattern(image)"
+              >
+                {{ patternGeneratingIndex === image.index ? '生成中…' : '拼豆图纸' }}
+              </button>
+              <button
+                v-if="image.patternAssets?.beads"
+                style="border: none; background: none; color: var(--primary); cursor: pointer; font-size: 12px;"
+                type="button"
+                @click="viewPatternAsset(image.patternAssets.beads, image.index, '拼豆实物效果图')"
+              >
+                拼豆实物
+              </button>
+              <button
+                v-if="image.patternAssets?.ironed"
+                style="border: none; background: none; color: var(--primary); cursor: pointer; font-size: 12px;"
+                type="button"
+                @click="viewPatternAsset(image.patternAssets.ironed, image.index, '熨烫成品效果图')"
+              >
+                熨烫成品
               </button>
               <button
                 style="border: none; background: none; color: var(--primary); cursor: pointer; font-size: 12px;"
@@ -123,6 +205,21 @@
       :tags="store.content.tags"
       :image-count="store.images.length"
       @close="showPublishModal = false"
+    />
+    <PatternGenerationModal
+      :visible="patternModalVisible"
+      :step="patternModalStep"
+      :page-number="(patternTarget?.index ?? 0) + 1"
+      :progress="patternProgress"
+      :preview-urls="patternPreviewUrls"
+      :metadata="patternPending?.result.metadata ?? null"
+      :error-message="patternErrorMessage"
+      :is-refining="isRefiningPattern"
+      :is-appending="isAppendingPattern"
+      @close="cancelPatternFlow"
+      @start="startAutomaticPattern"
+      @refine="refinePatternWithPerler"
+      @append="confirmPatternAppend"
     />
   </div>
 </template>
@@ -181,24 +278,58 @@
   color: white;
   transform: translateY(-1px);
 }
+.danger-action-btn:hover {
+  background: var(--primary-active);
+}
 
 .publish-button { white-space: nowrap; }
 .result-actions-wrap { display: grid; justify-items: end; gap: 6px; }
 .result-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 12px; }
 .publish-disabled-hint { margin: 0; color: var(--text-secondary); font-size: 12px; }
+.result-failure-panel { display: grid; gap: 10px; margin-bottom: 16px; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--primary-active) 42%, var(--border-color)); border-radius: 10px; background: color-mix(in srgb, var(--primary-active) 7%, var(--bg-card)); }
+.result-failure-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.result-failure-heading strong { color: var(--primary-active); font-size: 13px; }
+.result-failure-heading p { margin: 2px 0 0; color: var(--text-sub); font-size: 11px; }
+.result-failure-list { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.result-failure-list li { display: flex; align-items: flex-start; gap: 8px; color: var(--text-sub); font-size: 11px; line-height: 1.45; }
+.result-failure-list li span:first-child { flex: 0 0 auto; color: var(--primary-active); font-weight: 600; }
+.result-failure-list li span:last-child { overflow-wrap: anywhere; }
+.result-missing-image { display: flex; min-height: 220px; align-items: center; justify-content: center; flex-direction: column; gap: 5px; padding: 18px; background: var(--bg-subtle); color: var(--text-sub); text-align: center; }
+.result-missing-image strong { color: var(--primary-active); font-size: 12px; }
+.result-missing-image p { max-width: 220px; margin: 0; font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+.result-missing-icon { display: inline-flex; width: 28px; height: 28px; align-items: center; justify-content: center; border-radius: 50%; background: var(--primary-fade); color: var(--primary-active); font-weight: 700; }
+@media (max-width: 700px) {
+  .result-failure-heading { align-items: stretch; flex-direction: column; }
+  .result-failure-heading .btn { width: 100%; }
+}
 </style>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onUnmounted, ref, shallowRef } from 'vue'
 import { useRouter } from 'vue-router'
 import { useGeneratorStore } from '../stores/generator'
-import { regenerateImage } from '../api'
+import {
+  appendPatternPage,
+  deleteHistoryPage,
+  regenerateImage,
+} from '../api'
 import ContentDisplay from '../components/result/ContentDisplay.vue'
 import ErrorCard from '../components/common/ErrorCard.vue'
 import ImagePreviewModal from '../components/common/ImagePreviewModal.vue'
 import RegenerateImageModal from '../components/common/RegenerateImageModal.vue'
 import PublishModal from '../components/result/PublishModal.vue'
+import PatternGenerationModal from '../components/result/PatternGenerationModal.vue'
 import { normalizeApiError, type AppError } from '../utils/errors'
+import { useImageRetry } from '../composables/useImageRetry'
+import {
+  generatePatternAutomatically,
+  generatePatternWithPerler,
+  PerlerBridgeCancelledError,
+  type PerlerAutoJob,
+  type PerlerPatternResult,
+  type PerlerProgressUpdate,
+} from '../integrations/perlerBridge'
+import { DEFAULT_PERLER_SETTINGS, type PerlerPatternSettings } from '../integrations/perlerSettings'
 
 const router = useRouter()
 const store = useGeneratorStore()
@@ -207,6 +338,37 @@ const error = ref<AppError | null>(null)
 const previewImage = ref<{ src: string; alt: string } | null>(null)
 const regenerateTarget = ref<any | null>(null)
 const showPublishModal = ref(false)
+const patternGeneratingIndex = ref<number | null>(null)
+const deletingIndex = ref<number | null>(null)
+const isAppendingPattern = ref(false)
+const isRefiningPattern = ref(false)
+const patternPending = ref<{
+  sourceImageIndex: number
+  result: PerlerPatternResult
+} | null>(null)
+const patternTarget = ref<{ index: number; url: string } | null>(null)
+const patternModalStep = ref<'config' | 'progress' | 'preview'>('config')
+const patternProgress = ref<PerlerProgressUpdate | null>(null)
+const patternPreviewUrls = ref<{
+  pattern?: string
+  beads?: string
+  ironed?: string
+}>({})
+const patternErrorMessage = ref('')
+const patternSettings = ref<PerlerPatternSettings>({ ...DEFAULT_PERLER_SETTINGS })
+const activeAutoPatternJob = shallowRef<PerlerAutoJob | null>(null)
+let patternPipelineId = 0
+const patternModalVisible = computed(() => patternTarget.value !== null)
+const failedImages = computed(() => store.images.filter(image => image.status !== 'done' || !image.url))
+const hasFailedImages = computed(() => failedImages.value.length > 0)
+const failedCount = computed(() => failedImages.value.length)
+const isCharacterSheet = computed(() => store.seriesContext.content_mode === 'character_sheet')
+
+function setError(nextError: AppError | null) {
+  error.value = nextError
+}
+
+const { isRetrying, retryAllFailed } = useImageRetry(setError)
 
 const canPublish = computed(() => Boolean(
   store.recordId
@@ -222,11 +384,26 @@ const publishDisabledReason = computed(() => {
   return ''
 })
 
+function isPatternImage(image: { index: number }) {
+  return store.outline.pages.find(page => page.index === image.index)?.type === 'pattern'
+}
+
+function canCreatePattern(image: { index: number; url: string }) {
+  return Boolean(store.recordId && image.url && !isPatternImage(image))
+}
+
 const viewImage = (url: string) => {
   const image = store.images.find(item => item.url === url)
   previewImage.value = {
     src: url,
     alt: image ? `第 ${image.index + 1} 页大图` : '图片大图预览'
+  }
+}
+
+function viewPatternAsset(url: string, index: number, label: string) {
+  previewImage.value = {
+    src: url,
+    alt: `第 ${index + 1} 页${label}`,
   }
 }
 
@@ -265,6 +442,254 @@ const downloadAll = () => {
   }
 }
 
+const deleteResultPage = async (image: { index: number; url: string }) => {
+  if (
+    !store.recordId
+    || deletingIndex.value !== null
+    || patternModalVisible.value
+    || patternGeneratingIndex.value !== null
+  ) return
+
+  const page = store.outline.pages.find(item => item.index === image.index)
+  if (!page) return
+  const isPattern = page.type === 'pattern'
+  const label = isPattern ? '拼豆图纸' : '原始图片'
+  if (!window.confirm(`确定删除第 ${image.index + 1} 页${label}吗？此操作不可恢复。`)) return
+
+  deletingIndex.value = image.index
+  error.value = null
+  try {
+    const response = await deleteHistoryPage(store.recordId, image.index)
+    if (!response.success) {
+      error.value = normalizeApiError(
+        response.error || response.error_message || `删除${label}失败`,
+        `删除${label}失败`,
+      )
+      return
+    }
+    // The backend has already atomically removed the metadata and task-local
+    // assets. Keep the current result view in lockstep without reloading the
+    // whole work (which would discard in-memory references/user images).
+    store.removePageResult(image.index, {
+      taskId: response.record?.images.task_id,
+      generated: response.record?.images.generated,
+      pages: response.record?.outline.pages,
+    })
+    if (previewImage.value?.src === image.url) previewImage.value = null
+    if (regenerateTarget.value?.index === image.index) regenerateTarget.value = null
+  } catch (reason: unknown) {
+    error.value = normalizeApiError(reason, `删除${label}失败`)
+  } finally {
+    deletingIndex.value = null
+  }
+}
+
+const generatePattern = (image: { index: number; url: string }) => {
+  if (
+    !store.recordId
+    || !canCreatePattern(image)
+    || patternGeneratingIndex.value !== null
+    || patternModalVisible.value
+  ) return
+  patternTarget.value = image
+  patternModalStep.value = 'config'
+  patternProgress.value = null
+  patternErrorMessage.value = ''
+}
+
+function revokePatternPreview() {
+  Object.values(patternPreviewUrls.value).forEach(url => {
+    if (url) URL.revokeObjectURL(url)
+  })
+  patternPreviewUrls.value = {}
+}
+
+function setPatternPreview(result: PerlerPatternResult) {
+  revokePatternPreview()
+  // The three representations share one deterministic grid conversion. The
+  // bead rendering is preferred for the first preview, while the grid master
+  // remains the persisted construction image.
+  patternPreviewUrls.value = {
+    pattern: URL.createObjectURL(result.pattern),
+    ...(result.beads || result.preview ? { beads: URL.createObjectURL(result.beads ?? result.preview!) } : {}),
+    ...(result.ironed ? { ironed: URL.createObjectURL(result.ironed) } : {}),
+  }
+}
+
+function isCancelledPatternReason(reason: unknown): boolean {
+  return reason instanceof PerlerBridgeCancelledError
+    || (reason instanceof DOMException && reason.name === 'AbortError')
+}
+
+const startAutomaticPattern = async (settings: PerlerPatternSettings) => {
+  const target = patternTarget.value
+  if (
+    !target
+    || !store.recordId
+    || activeAutoPatternJob.value
+    || isRefiningPattern.value
+  ) return
+  const recordId = store.recordId
+  const pipelineId = ++patternPipelineId
+  patternSettings.value = { ...settings }
+  patternModalStep.value = 'progress'
+  patternProgress.value = { stage: 'connect', completed: 0, total: 1 }
+  patternGeneratingIndex.value = target.index
+  patternErrorMessage.value = ''
+  error.value = null
+
+  const isCurrent = () => (
+    patternPipelineId === pipelineId
+    && patternTarget.value?.index === target.index
+  )
+
+  try {
+    // Match Perler-to-perfect's AutoMode locally. The original raster is sent
+    // directly to the same deterministic worker; Perler is only opened by the
+    // explicit refine action below.
+    const job = generatePatternAutomatically({
+      recordId,
+      imageIndex: target.index,
+      imageUrl: `${target.url.split('?')[0]}?thumbnail=false`,
+      fileName: `redink-page-${target.index + 1}.png`,
+      settings,
+      onReady: () => {
+        if (isCurrent()) patternProgress.value = { stage: 'prepare', completed: 0, total: 1 }
+      },
+      onProgress: progress => {
+        if (isCurrent()) patternProgress.value = progress
+      },
+    })
+    activeAutoPatternJob.value = job
+    const result = await job.result
+    if (!isCurrent()) return
+    patternPending.value = {
+      sourceImageIndex: target.index,
+      result,
+    }
+    setPatternPreview(result)
+    patternModalStep.value = 'preview'
+    activeAutoPatternJob.value = null
+  } catch (reason: unknown) {
+    if (isCancelledPatternReason(reason)) return
+    if (!isCurrent()) return
+    patternModalStep.value = 'config'
+    patternErrorMessage.value = reason instanceof Error ? reason.message : '生成拼豆图纸失败。'
+    error.value = normalizeApiError(reason, '生成拼豆图纸失败')
+  } finally {
+    if (patternPipelineId === pipelineId) {
+      activeAutoPatternJob.value = null
+      patternGeneratingIndex.value = null
+    }
+  }
+}
+
+const cancelPatternFlow = () => {
+  if (isAppendingPattern.value || isRefiningPattern.value) return
+  patternPipelineId += 1
+  activeAutoPatternJob.value?.cancel()
+  activeAutoPatternJob.value = null
+  patternGeneratingIndex.value = null
+  patternPending.value = null
+  patternTarget.value = null
+  patternModalStep.value = 'config'
+  patternProgress.value = null
+  patternErrorMessage.value = ''
+  revokePatternPreview()
+}
+
+const refinePatternWithPerler = async () => {
+  const pending = patternPending.value
+  const target = patternTarget.value
+  if (!pending || !target || !store.recordId || isRefiningPattern.value || isAppendingPattern.value) return
+  isRefiningPattern.value = true
+  patternGeneratingIndex.value = target.index
+  patternErrorMessage.value = ''
+  error.value = null
+  try {
+    const result = await generatePatternWithPerler({
+      recordId: store.recordId,
+      imageIndex: target.index,
+      imageUrl: `${target.url.split('?')[0]}?thumbnail=false`,
+      fileName: `redink-page-${target.index + 1}.png`,
+      settings: patternSettings.value,
+      cells: pending.result.cells,
+      metadata: pending.result.metadata,
+    })
+    if (patternTarget.value?.index !== target.index) return
+    // Older Perler builds only return the edited grid PNG. Keep the local
+    // effect renders in that case so confirming the append still persists
+    // all three outputs. Newer builds return fresh effects, which always win.
+    const mergedResult: PerlerPatternResult = {
+      ...result,
+      ...(result.beads || result.preview || pending.result.beads || pending.result.preview
+        ? { beads: result.beads ?? result.preview ?? pending.result.beads ?? pending.result.preview }
+        : {}),
+      ...(result.ironed || pending.result.ironed
+        ? { ironed: result.ironed ?? pending.result.ironed }
+        : {}),
+      ...(result.preview || result.beads || pending.result.preview || pending.result.beads
+        ? { preview: result.preview ?? result.beads ?? pending.result.preview ?? pending.result.beads }
+        : {}),
+    }
+    patternPending.value = { ...pending, result: mergedResult }
+    setPatternPreview(mergedResult)
+  } catch (reason: unknown) {
+    patternErrorMessage.value = reason instanceof Error ? reason.message : 'Perler 编辑未完成，自动生成的预览已保留。'
+    error.value = normalizeApiError(reason, 'Perler 编辑未完成，自动生成的预览已保留')
+  } finally {
+    isRefiningPattern.value = false
+    patternGeneratingIndex.value = null
+  }
+}
+
+const confirmPatternAppend = async () => {
+  const pending = patternPending.value
+  if (!pending || !store.recordId || isAppendingPattern.value) return
+  isAppendingPattern.value = true
+  error.value = null
+  try {
+    const response = await appendPatternPage(store.recordId, {
+      requestId: pending.result.requestId,
+      sourceImageIndex: pending.sourceImageIndex,
+      columns: pending.result.metadata.columns,
+      rows: pending.result.metadata.rows,
+      usedColors: pending.result.metadata.usedColors,
+      pattern: pending.result.pattern,
+      beads: pending.result.beads ?? pending.result.preview,
+      ironed: pending.result.ironed,
+    })
+    if (!response.success || !response.filename || !response.record?.outline.pages) {
+      error.value = normalizeApiError(response.error || response.error_message || '服务器未确认追加', '追加拼豆图纸失败')
+      return
+    }
+    const page = response.record.outline.pages[response.page_index ?? response.record.outline.pages.length - 1]
+    if (!page || page.type !== 'pattern') {
+      error.value = normalizeApiError('服务器返回的图纸页面无效', '追加拼豆图纸失败')
+      return
+    }
+    store.appendPatternImage(page, response.filename, response.outputs || page.pattern?.outputs || {})
+    error.value = null
+    patternPending.value = null
+    patternTarget.value = null
+    patternModalStep.value = 'config'
+    patternProgress.value = null
+    patternErrorMessage.value = ''
+    revokePatternPreview()
+  } catch (reason: any) {
+    error.value = normalizeApiError(reason, '追加拼豆图纸失败')
+  } finally {
+    isAppendingPattern.value = false
+  }
+}
+
+onUnmounted(() => {
+  patternPipelineId += 1
+  activeAutoPatternJob.value?.cancel()
+  activeAutoPatternJob.value = null
+  revokePatternPreview()
+})
+
 const openRegenerateDialog = (image: any) => {
   if (regeneratingIndex.value === null) regenerateTarget.value = image
 }
@@ -295,7 +720,8 @@ const handleRegenerate = async (image: any, revisionRequest = '') => {
       fullOutline: store.outline.raw || '',
       userTopic: store.topic || '',
       recordId: store.recordId,
-      revisionRequest
+      revisionRequest,
+      series: store.getSeriesRequestContext()
     }
 
     const result = await regenerateImage(store.taskId, pageContent, true, context)

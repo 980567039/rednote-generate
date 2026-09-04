@@ -14,8 +14,25 @@ import json
 import base64
 import logging
 from flask import Blueprint, request, jsonify, Response, send_file
-from backend.errors import ensure_app_error
+from backend.errors import AppError, ensure_app_error
 from backend.services.image import ActiveGenerationError, get_image_service
+from backend.services.history import get_history_service
+from backend.services.pattern_ai import (
+    PatternAIGenerationError,
+    PatternAIInputError,
+    PatternAIUnsupportedProviderError,
+    parse_pattern_ai_request,
+    refine_pattern_image,
+    validate_pattern_preview,
+    validate_source_image,
+)
+from backend.services.series import (
+    build_context,
+    frozen_context_matches_mode,
+    get_template,
+    resolve_content_mode,
+    series_context_from_payload,
+)
 from .utils import (
     api_error_response,
     log_request,
@@ -27,11 +44,219 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+def _template_id_from_record(record_id):
+    if not record_id:
+        return None, None
+    try:
+        record = get_history_service().get_record(record_id)
+    except Exception:
+        return None, None
+    if not record:
+        return None, None
+    return record.get("series_template_id"), record
+
+
+def _series_context_for_request(data, record_id=None, topic=""):
+    """优先使用历史快照，其次项目条目快照，最后才读取当前模板。"""
+    result = {
+        "series_id": data.get("series_id"),
+        "series_template_id": data.get("series_template_id"),
+        "series_item_index": data.get("series_item_index"),
+        "series_item_title": data.get("series_item_title"),
+        "content_mode": data.get("content_mode"),
+    }
+    record = None
+    if record_id:
+        try:
+            record = get_history_service().get_record(record_id)
+        except Exception:
+            record = None
+    snapshot = (record or {}).get("series_template_snapshot")
+    requested_mode = data.get("content_mode")
+    has_requested_mode = requested_mode is not None and str(requested_mode).strip() != ""
+    if snapshot:
+        stored_context = (record or {}).get("series_context_snapshot") or ""
+        stored_mode = (record or {}).get("series_content_mode")
+        if not stored_mode:
+            stored_mode = snapshot.get("content_mode")
+        # A caller-provided mode is authoritative.  If it is absent, recover
+        # the mode from the frozen record/snapshot and finally from the legacy
+        # human-readable marker.
+        inferred_mode = resolve_content_mode(
+            requested_mode if has_requested_mode else stored_mode,
+            snapshot,
+            stored_context,
+        )
+        context = (
+            stored_context
+            if frozen_context_matches_mode(stored_context, inferred_mode)
+            else build_context(snapshot, topic, record.get("series_item_index"), inferred_mode)["series_context"]
+        )
+        result.update({
+            "series_id": record.get("series_id"),
+            "series_project_id": record.get("series_project_id") or record.get("series_id"),
+            "series_item_id": record.get("series_item_id"),
+            "series_template_id": snapshot.get("id"),
+            "series_item_index": record.get("series_item_index"),
+            "series_item_title": record.get("series_item_title") or topic,
+            "content_mode": inferred_mode,
+            "series_context": context,
+            "series_template": snapshot,
+        })
+        return result
+    # Some very early records have a frozen context but no template snapshot.
+    # Preserve that context while still recovering its content direction.
+    if record and (record.get("series_context_snapshot") or record.get("series_content_mode")):
+        stored_context = record.get("series_context_snapshot") or ""
+        inferred_mode = resolve_content_mode(
+            requested_mode if has_requested_mode else record.get("series_content_mode"),
+            None,
+            stored_context,
+        )
+        # 没有模板快照时无法完整重建系列规则；至少不要把与显式模式
+        # 相反的旧文本继续传给图片模型。保留同向旧上下文以兼容历史任务。
+        context = stored_context if frozen_context_matches_mode(stored_context, inferred_mode) else ""
+        result.update({
+            "series_id": record.get("series_id"),
+            "series_project_id": record.get("series_project_id") or record.get("series_id"),
+            "series_item_id": record.get("series_item_id"),
+            "series_item_index": record.get("series_item_index"),
+            "series_item_title": record.get("series_item_title") or topic,
+            "content_mode": inferred_mode,
+            "series_context": context,
+        })
+        return result
+    if data.get("series_project_id") and data.get("series_item_id"):
+        result.update(series_context_from_payload(data))
+        return result
+    template_id = data.get("series_template_id") or (record or {}).get("series_template_id")
+    template = get_template(template_id) if template_id else None
+    if template:
+        inferred_mode = resolve_content_mode(
+            requested_mode if has_requested_mode else (record or {}).get("series_content_mode"),
+            template,
+            (record or {}).get("series_context_snapshot", ""),
+        )
+        result.update(build_context(
+            template,
+            data.get("series_item_title") or (record or {}).get("series_item_title") or topic,
+            data.get("series_item_index") if data.get("series_item_index") is not None else (record or {}).get("series_item_index"),
+            inferred_mode,
+        ))
+        result["series_id"] = data.get("series_id") or (record or {}).get("series_id")
+    return result
+
+
 def create_image_blueprint():
     """创建图片路由蓝图（工厂函数，支持多次调用）"""
     image_bp = Blueprint('image', __name__)
 
     # ==================== 图片生成 ====================
+
+    @image_bp.route('/pattern/ai-refine', methods=['POST'])
+    def refine_pattern_with_ai():
+        """使用当前激活图片服务商执行拼豆素材的双阶段 AI 精修。"""
+        context = {"endpoint": "/api/pattern/ai-refine"}
+        try:
+            request_data = parse_pattern_ai_request(
+                request.form.get("stage"),
+                request.form.get("columns"),
+                request.form.get("rows"),
+                request.form.get("max_used_colors"),
+            )
+            context["stage"] = request_data.stage
+
+            source_upload = request.files.get("source")
+            if source_upload is None:
+                raise PatternAIInputError("缺少 source 图片")
+            source_bytes = _read_limited_upload(
+                source_upload, 25 * 1024 * 1024, "source"
+            )
+            source_png = validate_source_image(
+                source_bytes, source_upload.mimetype
+            )
+
+            pattern_preview_png = None
+            if request_data.stage == "pattern":
+                pattern_upload = request.files.get("pattern_preview")
+                if pattern_upload is None:
+                    raise PatternAIInputError(
+                        "stage=pattern 时必须提供 pattern_preview"
+                    )
+                pattern_bytes = _read_limited_upload(
+                    pattern_upload,
+                    10 * 1024 * 1024,
+                    "pattern_preview",
+                )
+                pattern_preview_png = validate_pattern_preview(
+                    pattern_bytes, pattern_upload.mimetype
+                )
+
+            output_png = refine_pattern_image(
+                get_image_service(),
+                request_data,
+                source_png,
+                pattern_preview_png,
+            )
+            return Response(
+                output_png,
+                status=200,
+                mimetype="image/png",
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Pattern-AI-Stage": request_data.stage,
+                },
+            )
+        except PatternAIInputError as exc:
+            return api_error_response(
+                validation_error(
+                    str(exc),
+                    "请检查规格、图片格式和文件大小后重试。",
+                ),
+                context=context,
+            )
+        except PatternAIUnsupportedProviderError:
+            return api_error_response(
+                AppError(
+                    code="PATTERN_AI_REFERENCE_UNSUPPORTED",
+                    title="当前服务商无法执行 AI 精修",
+                    detail="当前图片服务商不支持参考图AI精修",
+                    suggestion="请切换到 image_api 或 Google GenAI；前端可继续使用未精修结果。",
+                    status=400,
+                    retryable=False,
+                ),
+                context=context,
+            )
+        except PatternAIGenerationError:
+            return api_error_response(
+                AppError(
+                    code="PATTERN_AI_FAILED",
+                    title="拼豆图片 AI 精修失败",
+                    detail="图片服务商未能完成本次精修。",
+                    suggestion="请稍后重试；前端可继续使用未精修结果。",
+                    status=502,
+                    retryable=True,
+                ),
+                context=context,
+            )
+        except Exception as exc:
+            # 仅记录异常类型，避免配置或上游异常中的密钥进入日志和响应。
+            logger.error(
+                "拼豆 AI 精修接口异常: stage=%s, error_type=%s",
+                context.get("stage", "unknown"),
+                type(exc).__name__,
+            )
+            return api_error_response(
+                AppError(
+                    code="PATTERN_AI_FAILED",
+                    title="拼豆图片 AI 精修失败",
+                    detail="图片服务暂时不可用。",
+                    suggestion="请稍后重试；前端可继续使用未精修结果。",
+                    status=502,
+                    retryable=True,
+                ),
+                context=context,
+            )
 
     @image_bp.route('/generate', methods=['POST'])
     def generate_images():
@@ -59,6 +284,7 @@ def create_image_blueprint():
             force = bool(data.get('force', False))
             full_outline = data.get('full_outline', '')
             user_topic = data.get('user_topic', '')
+            series_kwargs = _series_context_for_request(data, record_id, user_topic)
 
             # 解析 base64 格式的用户参考图片
             user_images = _parse_base64_images(data.get('user_images', []))
@@ -86,6 +312,7 @@ def create_image_blueprint():
                     task_id=task_id,
                     record_id=record_id,
                     force=force,
+                    **series_kwargs,
                 )
             except ActiveGenerationError as exc:
                 return jsonify({
@@ -117,6 +344,7 @@ def create_image_blueprint():
                     force=force,
                     prepared=True,
                     cached=reservation["cached"],
+                    **series_kwargs,
                 ):
                     event_type = event["event"]
                     event_data = _normalize_sse_error(
@@ -222,6 +450,9 @@ def create_image_blueprint():
             page = data.get('page')
             use_reference = data.get('use_reference', True)
             record_id = data.get('record_id')
+            series_data = _series_context_for_request(data, record_id)
+            series_context = series_data.get("series_context", "")
+            content_mode = series_data.get("content_mode") or ""
 
             log_request('/retry', {
                 'task_id': task_id,
@@ -243,6 +474,8 @@ def create_image_blueprint():
                 page,
                 use_reference,
                 record_id=record_id,
+                series_context=series_context,
+                **({"content_mode": content_mode} if content_mode else {}),
             )
 
             if result["success"]:
@@ -278,6 +511,9 @@ def create_image_blueprint():
             task_id = data.get('task_id')
             pages = data.get('pages')
             record_id = data.get('record_id')
+            series_data = _series_context_for_request(data, record_id)
+            series_context = series_data.get("series_context", "")
+            content_mode = series_data.get("content_mode") or ""
 
             log_request('/retry-failed', {
                 'task_id': task_id,
@@ -297,7 +533,13 @@ def create_image_blueprint():
 
             def generate():
                 """SSE 事件生成器"""
-                for event in image_service.retry_failed_images(task_id, pages, record_id=record_id):
+                for event in image_service.retry_failed_images(
+                    task_id,
+                    pages,
+                    record_id=record_id,
+                    series_context=series_context,
+                    **({"content_mode": content_mode} if content_mode else {}),
+                ):
                     event_type = event["event"]
                     event_data = _normalize_sse_error(
                         event_type,
@@ -351,6 +593,9 @@ def create_image_blueprint():
             user_topic = data.get('user_topic', '')
             record_id = data.get('record_id')
             revision_request = data.get('revision_request', '')
+            series_data = _series_context_for_request(data, record_id, user_topic)
+            series_context = series_data.get("series_context", "")
+            content_mode = series_data.get("content_mode") or ""
             if not isinstance(revision_request, str):
                 revision_request = ''
             revision_request = revision_request.strip()[:500]
@@ -375,7 +620,9 @@ def create_image_blueprint():
                 full_outline=full_outline,
                 user_topic=user_topic,
                 record_id=record_id,
-                revision_request=revision_request
+                revision_request=revision_request,
+                series_context=series_context,
+                **({"content_mode": content_mode} if content_mode else {}),
             )
 
             if result["success"]:
@@ -472,6 +719,17 @@ def _parse_base64_images(images_base64: list) -> list:
         images.append(base64.b64decode(img_b64))
 
     return images
+
+
+def _read_limited_upload(upload, max_bytes: int, field_name: str) -> bytes:
+    """最多读取限制值加一字节，避免仅依赖不可信的 Content-Length。"""
+    data = upload.stream.read(max_bytes + 1)
+    if not data:
+        raise PatternAIInputError(f"{field_name} 图片不能为空")
+    if len(data) > max_bytes:
+        size_mb = max_bytes // (1024 * 1024)
+        raise PatternAIInputError(f"{field_name} 图片不能超过 {size_mb}MB")
+    return data
 
 
 def _normalize_sse_error(event_type: str, data: dict, context: dict) -> dict:

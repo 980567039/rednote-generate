@@ -111,6 +111,25 @@ def test_response_extractor_supports_b64_data_url_and_url():
     assert downloads == ["https://example.com/image.png"]
 
 
+def test_response_extractor_preserves_upstream_error_instead_of_reporting_missing_data():
+    extractor = ImageResponseExtractor(lambda url: b"downloaded")
+
+    try:
+        extractor.extract_from_images_response({
+            "error": {
+                "message": "Your request was rejected by the safety system.",
+                "code": "moderation_blocked",
+            }
+        })
+    except ValueError as exc:
+        message = str(exc)
+        assert "safety system" in message
+        assert "moderation_blocked" in message
+        assert "未返回 data" not in message
+    else:
+        raise AssertionError("上游 error 响应应被转换为可读异常")
+
+
 def test_network_failure_is_not_retried_by_default():
     session = FakeSession([requests.exceptions.SSLError("connection reset")])
     policy = ImageProviderPolicy.from_config({

@@ -14,7 +14,8 @@
  * 4. result: 查看生成结果
  */
 import { defineStore } from 'pinia'
-import type { Page } from '../api'
+import type { Page, SeriesRequestContext } from '../api'
+import { getImageUrl } from '../api/image'
 
 /**
  * 生成的图片信息
@@ -22,6 +23,11 @@ import type { Page } from '../api'
 export interface GeneratedImage {
   index: number  // 图片对应的页面索引
   url: string    // 图片URL
+  /** 附加的拼豆视觉输出（仅 pattern 页面存在）。 */
+  patternAssets?: {
+    beads?: string
+    ironed?: string
+  }
   status: 'queued' | 'generating' | 'done' | 'error' | 'retrying' | 'interrupted'  // 生成状态
   error?: string      // 错误信息
   retryable?: boolean // 是否可以重试
@@ -75,6 +81,9 @@ export interface GeneratorState {
   // 历史记录ID（用于保存和加载历史记录）
   recordId: string | null
 
+  // 系列作品规则上下文。普通自由创作为空对象。
+  seriesContext: SeriesRequestContext
+
   // 用户上传的参考图片（File对象，不会被持久化）
   userImages: File[]
 
@@ -95,6 +104,7 @@ export interface WorkReplacement {
     pages: Page[]
   }
   recordId: string | null
+  seriesContext?: SeriesRequestContext
   taskId?: string | null
   images?: GeneratedImage[]
   progress?: GeneratorState['progress']
@@ -152,6 +162,7 @@ function saveState(state: GeneratorState) {
       images: state.images,                  // 生成的图片结果
       taskId: state.taskId,                  // 任务ID
       recordId: state.recordId,              // 历史记录ID
+      seriesContext: state.seriesContext,
       content: state.content,                // 生成的内容（标题、文案、标签）
       outlineStatus: state.outlineStatus,    // 大纲生成状态
       lastSavedAt: state.lastSavedAt         // 最后保存时间
@@ -195,6 +206,8 @@ export const useGeneratorStore = defineStore('generator', {
       // 历史记录ID
       recordId: saved.recordId || null,
 
+      seriesContext: saved.seriesContext || {},
+
       // 用户上传的参考图片（不从 localStorage 恢复）
       userImages: [],
 
@@ -226,6 +239,7 @@ export const useGeneratorStore = defineStore('generator', {
       this.images = []
       this.taskId = null
       this.recordId = null
+      this.seriesContext = {}
       this.userImages = userImages
       this.content = createEmptyContent()
       this.outlineStatus = 'done'
@@ -241,6 +255,7 @@ export const useGeneratorStore = defineStore('generator', {
       this.topic = work.topic
       this.outline = work.outline
       this.recordId = work.recordId
+      this.seriesContext = { ...(work.seriesContext || {}) }
       this.taskId = work.taskId || null
       this.images = work.images || []
       this.progress = work.progress || createEmptyProgress()
@@ -265,6 +280,13 @@ export const useGeneratorStore = defineStore('generator', {
 
     isCurrentWork(version: number) {
       return version === this.workVersion
+    },
+
+    getSeriesRequestContext(): SeriesRequestContext {
+      return {
+        ...this.seriesContext,
+        ...(this.recordId ? { record_id: this.recordId } : {})
+      }
     },
 
     requestFreshImageGeneration() {
@@ -340,7 +362,7 @@ export const useGeneratorStore = defineStore('generator', {
      * @param type 页面类型：cover-封面, content-内容, summary-总结
      * @param content 页面内容，默认为空
      */
-    addPage(type: 'cover' | 'content' | 'summary', content: string = '') {
+    addPage(type: 'cover' | 'content' | 'summary' | 'pattern', content: string = '') {
       const newPage: Page = {
         index: this.outline.pages.length,
         type,
@@ -357,7 +379,7 @@ export const useGeneratorStore = defineStore('generator', {
      * @param type 页面类型
      * @param content 页面内容
      */
-    insertPage(afterIndex: number, type: 'cover' | 'content' | 'summary', content: string = '') {
+    insertPage(afterIndex: number, type: 'cover' | 'content' | 'summary' | 'pattern', content: string = '') {
       const newPage: Page = {
         index: afterIndex + 1,
         type,
@@ -480,6 +502,94 @@ export const useGeneratorStore = defineStore('generator', {
       }
     },
 
+    appendPatternImage(
+      page: Page,
+      filename: string,
+      outputs: { beads?: string; ironed?: string } = {},
+    ) {
+      if (!this.taskId || this.outline.pages.some(existing => existing.index === page.index)) return
+      this.outline.pages.push(page)
+      this.outline.pages.sort((first, second) => first.index - second.index)
+      this.syncRawFromPages()
+      this.images.push({
+        index: page.index,
+        url: `/api/images/${this.taskId}/${filename}?t=${Date.now()}`,
+        ...(outputs.beads || outputs.ironed ? {
+          patternAssets: {
+            ...(outputs.beads ? { beads: `/api/images/${this.taskId}/${outputs.beads}?t=${Date.now()}` } : {}),
+            ...(outputs.ironed ? { ironed: `/api/images/${this.taskId}/${outputs.ironed}?t=${Date.now()}` } : {}),
+          },
+        } : {}),
+        status: 'done'
+      })
+      this.images.sort((first, second) => first.index - second.index)
+      this.progress.total = this.outline.pages.length
+      this.progress.current = this.images.filter(image => image.status === 'done' && Boolean(image.url)).length
+      this.progress.status = 'done'
+      this.progress.phase = 'finished'
+      this.progress.message = '拼豆图纸已追加到最后一页'
+      this.stage = 'result'
+    },
+
+    /**
+     * 从当前结果页移除一个已删除的历史页面。
+     * 服务端会先完成文件和历史记录清理；这里只同步内存状态，避免
+     * 删除后刷新页面仍显示旧卡片。页面索引与 generated 数组始终保持对齐。
+     */
+    removePageResult(
+      index: number,
+      updated?: {
+        taskId?: string | null
+        generated?: string[]
+        pages?: Page[]
+      },
+    ) {
+      const pagePosition = this.outline.pages.findIndex(page => page.index === index)
+      if (pagePosition < 0) return false
+
+      this.outline.pages.splice(pagePosition, 1)
+      this.outline.pages.forEach((page, pageIndex) => {
+        page.index = pageIndex
+      })
+      this.syncRawFromPages()
+
+      const taskId = updated?.taskId ?? this.taskId
+      const hasUpdatedFiles = Array.isArray(updated?.generated)
+      this.images = this.images
+        .filter(image => image.index !== index)
+        .map(image => {
+          const next = image.index > index ? { ...image, index: image.index - 1 } : { ...image }
+          if (hasUpdatedFiles && taskId) {
+            const filename = updated?.generated?.[next.index] || ''
+            next.url = filename
+              ? `${getImageUrl(taskId, filename)}&t=${Date.now()}`
+              : ''
+            const page = updated?.pages?.find(item => item.index === next.index)
+            const outputs = page?.pattern?.outputs
+            if (outputs?.beads || outputs?.ironed) {
+              next.patternAssets = {
+                ...(outputs.beads ? { beads: `${getImageUrl(taskId, outputs.beads, false)}&t=${Date.now()}` } : {}),
+                ...(outputs.ironed ? { ironed: `${getImageUrl(taskId, outputs.ironed, false)}&t=${Date.now()}` } : {}),
+              }
+            } else {
+              delete next.patternAssets
+            }
+          }
+          return next
+        })
+        .sort((first, second) => first.index - second.index)
+
+      this.progress.total = this.outline.pages.length
+      this.progress.current = this.images.filter(image => image.status === 'done' && Boolean(image.url)).length
+      this.progress.status = this.images.every(image => image.status === 'done' && Boolean(image.url))
+        ? 'done'
+        : 'error'
+      this.progress.phase = 'finished'
+      this.progress.message = '页面已删除'
+      this.stage = 'result'
+      return true
+    },
+
     /**
      * 完成图片生成流程
      * @param taskId 生成任务的ID
@@ -562,6 +672,7 @@ export const useGeneratorStore = defineStore('generator', {
 
       // 清空历史记录ID
       this.recordId = null
+      this.seriesContext = {}
 
       // 清空用户上传的参考图片
       this.userImages = []
@@ -711,6 +822,7 @@ export function setupAutoSave() {
       images: store.images,                  // 生成的图片结果
       taskId: store.taskId,                  // 任务ID
       recordId: store.recordId,              // 历史记录ID
+      seriesContext: store.seriesContext,
       content: store.content,                // 生成的内容
       outlineStatus: store.outlineStatus,    // 大纲生成状态
       lastSavedAt: store.lastSavedAt         // 最后保存时间

@@ -35,7 +35,7 @@ DEFAULT_CONFIG = {
     "default_mode": "preview",
 }
 
-TERMINAL_STATUSES = {"published", "submitted", "failed", "unknown", "auth_required"}
+TERMINAL_STATUSES = {"published", "submitted", "failed", "unknown", "auth_required", "cancelled"}
 ACTIVE_STATUSES = {
     "queued",
     "validating",
@@ -45,11 +45,14 @@ ACTIVE_STATUSES = {
     "ready_for_review",
     "submitting",
 }
+CANCELLABLE_STATUSES = ACTIVE_STATUSES | {"ready_for_review"}
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 NOTE_URL_RE = re.compile(
     r"https?://(?:www\.)?xiaohongshu\.com/explore/[A-Za-z0-9_-]+(?:\?[^\s]+)?",
     re.IGNORECASE,
 )
+XHS_CREATOR_LOGIN_URL = "https://creator.xiaohongshu.com/login"
+COMMAND_OUTPUT_LIMIT = 2000
 
 
 class PublishServiceError(Exception):
@@ -65,6 +68,15 @@ class PublishServiceError(Exception):
             retryable=False,
         )
         super().__init__(detail)
+
+
+class PublishCommandTimeout(TimeoutError):
+    """发布器子进程超时，同时保留可安全裁剪的部分输出。"""
+
+    def __init__(self, stdout: str = "", stderr: str = ""):
+        self.stdout = stdout
+        self.stderr = stderr
+        super().__init__("发布器命令执行超时")
 
 
 def _now() -> str:
@@ -155,10 +167,15 @@ class PublishService:
         self.history_service = history_service
         self.runner = runner or subprocess.run
         self._lock = threading.RLock()
+        # 登录检查、打开登录页和发布任务都会操作同一个 Chrome 标签页。
+        # 同时启动两个 CLI 会互相导航页面，最终表现为“登录页很慢/二维码失败”。
+        self._auth_operation_lock = threading.Lock()
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
         self._tasks: Dict[str, Dict[str, Any]] = {}
+        self._active_processes: Dict[str, subprocess.Popen] = {}
+        self._cancel_requested: set[str] = set()
         self._load_tasks_and_recover()
         if start_worker:
             self._worker = threading.Thread(target=self._worker_loop, name="xhs-publish-worker", daemon=True)
@@ -377,6 +394,45 @@ class PublishService:
             self._queue.put(task_id)
             return dict(task)
 
+    def cancel_task(self, task_id: str) -> Dict[str, Any]:
+        """取消尚未完成的发布任务，并终止其本地发布器子进程。"""
+        process: subprocess.Popen | None = None
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                raise PublishServiceError(
+                    "NOT_FOUND",
+                    "发布任务不存在",
+                    f"找不到发布任务：{task_id}。",
+                    "请刷新任务列表后重试。",
+                    404,
+                )
+            status = str(task.get("status") or "")
+            if status in TERMINAL_STATUSES:
+                return dict(task)
+            if status not in CANCELLABLE_STATUSES and status != "submitting":
+                raise PublishServiceError(
+                    "CONFLICT",
+                    "任务当前不可停止",
+                    f"任务当前状态为 {status or '未知'}，无法安全停止。",
+                    "请等待任务进入可停止状态后重试。",
+                    409,
+                )
+            self._cancel_requested.add(task_id)
+            process = self._active_processes.get(task_id)
+            if status == "submitting":
+                task["status"] = "unknown"
+                task["error"] = "已停止本机发布进程，但无法确认平台是否已经提交，请到小红书检查。"
+            else:
+                task["status"] = "cancelled"
+                task["error"] = "用户关闭发布弹窗，发布任务已取消。"
+            task["updated_at"] = _now()
+            self._persist_tasks()
+            result = dict(task)
+        if process is not None:
+            self._terminate_process(process)
+        return result
+
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -412,101 +468,390 @@ class PublishService:
             raise PublishServiceError(
                 "PUBLISHER_UNAVAILABLE",
                 "小红书发布组件不可用",
-                f"未找到发布器脚本：{script}。",
+                f"未找到发布器脚本 {script_name}。",
                 "请安装 third_party/XiaohongshuSkills，或设置 XHS_PUBLISHER_DIR 指向该目录。",
                 503,
             )
         return script
 
     def _run_command(self, args: list[str], timeout: float = 300) -> tuple[int, str, str]:
+        return self._run_command_for_task(args, timeout=timeout)
+
+    def _run_command_for_task(
+        self,
+        args: list[str],
+        timeout: float = 300,
+        task_id: str | None = None,
+    ) -> tuple[int, str, str]:
+        # 保留注入 runner 的测试/开发能力；生产环境使用 Popen，才能在用户
+        # 关闭弹窗时可靠终止发布器子进程，而不是只停止前端轮询。
+        if self.runner is subprocess.run:
+            process = subprocess.Popen(
+                args,
+                shell=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=str(self.publisher_dir),
+            )
+            if task_id:
+                with self._lock:
+                    self._active_processes[task_id] = process
+            try:
+                try:
+                    stdout, stderr = process.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired as exc:
+                    self._terminate_process(process)
+                    stdout, stderr = process.communicate()
+                    raise PublishCommandTimeout(
+                        stdout or (exc.stdout or ""),
+                        stderr or (exc.stderr or ""),
+                    ) from exc
+                return int(process.returncode or 0), stdout or "", stderr or ""
+            finally:
+                if task_id:
+                    with self._lock:
+                        if self._active_processes.get(task_id) is process:
+                            self._active_processes.pop(task_id, None)
         try:
             result = self.runner(args, shell=False, capture_output=True, text=True, timeout=timeout, cwd=str(self.publisher_dir))
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
             stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-            raise TimeoutError(f"发布命令超时：{stdout}\n{stderr}")
+            raise PublishCommandTimeout(stdout, stderr) from exc
         return int(getattr(result, "returncode", 0)), str(getattr(result, "stdout", "") or ""), str(getattr(result, "stderr", "") or "")
 
     @staticmethod
-    def _combine_output(stdout: str, stderr: str) -> str:
-        return (stdout + ("\n" + stderr if stderr else "")).strip()[-8000:]
+    def _terminate_process(process: subprocess.Popen) -> None:
+        """尽力终止发布器进程，超时后再强制结束。"""
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except OSError:
+            return
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+    def _task_cancelled(self, task_id: str) -> bool:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            return task_id in self._cancel_requested or bool(task and task.get("status") in {"cancelled", "unknown"})
+
+    def _run_auth_command(
+        self,
+        args: list[str],
+        timeout: float,
+        task_id: str | None = None,
+    ) -> tuple[int, str, str]:
+        """串行执行会导航 Chrome 的登录命令，避免标签页被并发请求抢占。"""
+        if not self._auth_operation_lock.acquire(timeout=0.5):
+            raise PublishServiceError(
+                "PUBLISH_AUTH_BUSY",
+                "小红书登录流程正在进行",
+                "已有登录检查或登录页启动请求正在操作 Chrome。",
+                "请等待当前操作完成后再重试。",
+                409,
+            )
+        try:
+            return self._run_command_for_task(args, timeout=timeout, task_id=task_id)
+        finally:
+            self._auth_operation_lock.release()
+
+    def _combine_output(self, stdout: str, stderr: str) -> str:
+        """合并并裁剪 CLI 输出，避免 API 暴露本机路径或常见凭据。"""
+        output = (stdout + ("\n" + stderr if stderr else "")).strip()
+        for path, replacement in (
+            (str(self.project_root), "<project>"),
+            (str(self.publisher_dir), "<publisher>"),
+        ):
+            if path:
+                output = output.replace(path, replacement)
+        output = re.sub(r"/Users/[^/\s]+", "<user-home>", output)
+        output = re.sub(r"(?i)(authorization\s*:\s*bearer\s+)\S+", r"\1<redacted>", output)
+        output = re.sub(
+            r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[=:]\s*)\S+",
+            r"\1<redacted>",
+            output,
+        )
+        output = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "<redacted>", output)
+        output = re.sub(r"data:image/[^;\s]+;base64,[A-Za-z0-9+/=]+", "<image-data>", output)
+        output = re.sub(
+            r'(?i)("qrcode_base64"\s*:\s*")[^"]*',
+            r'\1<image-data>',
+            output,
+        )
+        return output[-COMMAND_OUTPUT_LIMIT:]
+
+    @staticmethod
+    def _extract_command_json(stdout: str, marker: str) -> Optional[Dict[str, Any]]:
+        """从 CLI 标记后的输出中提取首个 JSON 对象。"""
+        marker_index = (stdout or "").find(marker)
+        if marker_index < 0:
+            return None
+        raw = stdout[marker_index + len(marker):].lstrip()
+        try:
+            value, _ = json.JSONDecoder().raw_decode(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _auth_failure(app_error: AppError, *, output: str = "", login: bool = False) -> Dict[str, Any]:
+        """构造登录相关接口的统一错误结构，避免前端误用其他业务兜底文案。"""
+        result: Dict[str, Any] = {
+            "success": False,
+            "message": app_error.to_message(),
+            "error": app_error.to_dict(),
+            "error_message": app_error.to_message(),
+            "output": output,
+            "status": app_error.status,
+        }
+        if login:
+            result.update(login_started=False, login_url=XHS_CREATOR_LOGIN_URL)
+        else:
+            result.update(logged_in=False, authenticated=False, login_url=XHS_CREATOR_LOGIN_URL)
+        return result
 
     @staticmethod
     def _extract_note_url(output: str) -> Optional[str]:
         match = NOTE_URL_RE.search(output or "")
         return match.group(0) if match else None
 
-    def _check_login(self, config: Dict[str, Any]) -> tuple[bool, int, str]:
+    def _check_login(self, config: Dict[str, Any], task_id: str | None = None) -> tuple[bool, int, str]:
         script = self._require_script("cdp_publish.py")
-        args = [sys.executable, str(script), *self._command_options(config), "check-login"]
-        rc, stdout, stderr = self._run_command(args, timeout=60)
+        args = [
+            sys.executable,
+            str(script),
+            *self._command_options(config),
+            "--reuse-existing-tab",
+            "check-login",
+        ]
+        rc, stdout, stderr = self._run_auth_command(args, timeout=60, task_id=task_id)
         output = self._combine_output(stdout, stderr)
         return rc == 0 and "NOT_LOGGED_IN" not in output, rc, output
+
+    @staticmethod
+    def _login_page_was_opened(output: str) -> bool:
+        """识别二维码尚未返回、但 CLI 已经成功打开登录页的情况。"""
+        text = (output or "").lower()
+        return any(
+            signal in text
+            for signal in (
+                "login page is open",
+                "login_ready",
+                "navigating to https://creator.xiaohongshu.com/login",
+                "failed to locate login qr code",
+                '"current_url": "https://creator.xiaohongshu.com/login',
+            )
+        )
 
     def auth_check(self) -> Dict[str, Any]:
         config = self.get_config()
         try:
             logged_in, rc, output = self._check_login(config)
         except PublishServiceError as exc:
-            return {
-                "success": False,
-                "logged_in": False,
-                "authenticated": False,
-                "message": exc.app_error.to_message(),
-                "error": exc.app_error.to_dict(),
-                "output": "",
-                "status": exc.app_error.status,
-            }
+            return self._auth_failure(exc.app_error)
+        except PublishCommandTimeout as exc:
+            return self._auth_failure(
+                AppError(
+                    code="PUBLISH_AUTH_CHECK_TIMEOUT",
+                    title="检查小红书登录状态超时",
+                    detail="本地发布器未能在限定时间内完成登录状态检查。",
+                    suggestion="请确认 Chrome 可以正常启动并稍后重试。",
+                    status=504,
+                    retryable=True,
+                ),
+                output=self._combine_output(exc.stdout, exc.stderr),
+            )
         except Exception as exc:
-            return {"success": False, "logged_in": False, "authenticated": False, "message": str(exc), "output": "", "status": 502}
-        success = rc in {0, 1}
+            logger.warning("检查小红书登录状态失败: %s", exc)
+            return self._auth_failure(
+                AppError(
+                    code="PUBLISH_AUTH_CHECK_FAILED",
+                    title="检查小红书登录状态失败",
+                    detail="本地发布器无法完成登录状态检查。",
+                    suggestion="请检查 Chrome、CDP 端口和发布器目录后重试。",
+                    status=502,
+                    retryable=True,
+                )
+            )
+        not_logged_in = "NOT_LOGGED_IN" in output
+        success = rc == 0 or (rc == 1 and not_logged_in)
+        if not success:
+            return self._auth_failure(
+                AppError(
+                    code="PUBLISH_AUTH_CHECK_FAILED",
+                    title="检查小红书登录状态失败",
+                    detail=f"本地发布器以退出码 {rc} 结束，未能确认登录状态。",
+                    suggestion="请检查 Chrome、CDP 端口和发布器输出后重试。",
+                    status=502,
+                    retryable=True,
+                ),
+                output=output,
+            )
         return {
-            "success": success,
+            "success": True,
             "logged_in": logged_in,
             "authenticated": logged_in,
-            "message": ("已登录小红书" if logged_in else "尚未登录小红书") if success else "检查小红书登录状态失败",
+            "message": "已登录小红书" if logged_in else "尚未登录小红书",
+            "login_url": XHS_CREATOR_LOGIN_URL,
             "output": output,
             "returncode": rc,
-            **({"status": 502} if not success else {}),
         }
 
     def auth_login(self) -> Dict[str, Any]:
         config = self.get_config()
         try:
             script = self._require_script("cdp_publish.py")
-            options = ["--host", "127.0.0.1", "--port", str(config["port"])]
-            if config.get("account"):
-                options.extend(["--account", config["account"]])
-            args = [sys.executable, str(script), *options, "login"]
-            rc, stdout, stderr = self._run_command(args, timeout=120)
+            options = self._command_options(config, allow_headless=False)
+            args = [
+                sys.executable,
+                str(script),
+                *options,
+                "--reuse-existing-tab",
+                "get-login-qrcode",
+                "--wait-seconds",
+                "3",
+            ]
+            rc, stdout, stderr = self._run_auth_command(args, timeout=20)
         except PublishServiceError as exc:
-            return {
-                "success": False,
-                "login_started": False,
-                "message": exc.app_error.to_message(),
-                "error": exc.app_error.to_dict(),
-                "output": "",
-                "status": exc.app_error.status,
-            }
+            return self._auth_failure(exc.app_error, login=True)
+        except PublishCommandTimeout as exc:
+            return self._auth_failure(
+                AppError(
+                    code="PUBLISH_LOGIN_TIMEOUT",
+                    title="打开小红书登录页超时",
+                    detail="本地发布器未能在限定时间内打开登录页。",
+                    suggestion="请确认 Chrome 可以正常启动并稍后重试。",
+                    status=504,
+                    retryable=True,
+                ),
+                output=self._combine_output(exc.stdout, exc.stderr),
+                login=True,
+            )
         except Exception as exc:
-            return {"success": False, "login_started": False, "message": str(exc), "output": "", "status": 502}
+            logger.warning("打开小红书登录页失败: %s", exc)
+            return self._auth_failure(
+                AppError(
+                    code="PUBLISH_LOGIN_FAILED",
+                    title="打开小红书登录页失败",
+                    detail="本地发布器无法启动登录流程。",
+                    suggestion="请检查 Chrome、CDP 端口和发布器目录后重试。",
+                    status=502,
+                    retryable=True,
+                ),
+                login=True,
+            )
         output = self._combine_output(stdout, stderr)
+        if rc != 0:
+            if self._login_page_was_opened(output):
+                return {
+                    "success": True,
+                    "login_started": True,
+                    "logged_in": False,
+                    "authenticated": False,
+                    "login_url": XHS_CREATOR_LOGIN_URL,
+                    "qrcode_data_url": "",
+                    "mime_type": "image/png",
+                    "message": "小红书登录页已打开，二维码仍在加载，请在浏览器扫码或稍后重试",
+                    "output": output,
+                    "returncode": rc,
+                }
+            return self._auth_failure(
+                AppError(
+                    code="PUBLISH_LOGIN_FAILED",
+                    title="打开小红书登录页失败",
+                    detail=f"本地发布器以退出码 {rc} 结束，登录流程未启动。",
+                    suggestion="请检查 Chrome、CDP 端口和发布器输出后重试。",
+                    status=502,
+                    retryable=True,
+                ),
+                output=output,
+                login=True,
+            )
+        payload = self._extract_command_json(stdout, "GET_LOGIN_QRCODE_RESULT:")
+        if payload is None:
+            if self._login_page_was_opened(output):
+                return {
+                    "success": True,
+                    "login_started": True,
+                    "logged_in": False,
+                    "authenticated": False,
+                    "login_url": XHS_CREATOR_LOGIN_URL,
+                    "qrcode_data_url": "",
+                    "mime_type": "image/png",
+                    "message": "小红书登录页已打开，二维码仍在加载，请在浏览器扫码或稍后重试",
+                    "output": output,
+                    "returncode": rc,
+                }
+            return self._auth_failure(
+                AppError(
+                    code="PUBLISH_LOGIN_FAILED",
+                    title="打开小红书登录页失败",
+                    detail="本地发布器没有返回可识别的登录二维码结果。",
+                    suggestion="请确认 XiaohongshuSkills 版本支持 get-login-qrcode 后重试。",
+                    status=502,
+                    retryable=True,
+                ),
+                output=output,
+                login=True,
+            )
+        logged_in = payload.get("logged_in") is True
+        qrcode_data_url = payload.get("qrcode_data_url")
+        # 兼容较旧的 XiaohongshuSkills：有些版本只返回裸 base64，
+        # 这里在服务层补成前端可直接使用的 data URL。
+        if not isinstance(qrcode_data_url, str) or not qrcode_data_url.startswith("data:image/"):
+            raw_base64 = payload.get("qrcode_base64")
+            mime_type = payload.get("mime_type") or "image/png"
+            if isinstance(raw_base64, str) and raw_base64 and isinstance(mime_type, str):
+                qrcode_data_url = f"data:{mime_type};base64,{raw_base64}"
+        if not logged_in and (
+            not isinstance(qrcode_data_url, str)
+            or not qrcode_data_url.startswith("data:image/")
+        ):
+            return self._auth_failure(
+                AppError(
+                    code="PUBLISH_LOGIN_FAILED",
+                    title="获取小红书登录二维码失败",
+                    detail="本地发布器已打开登录流程，但没有返回有效二维码。",
+                    suggestion="请关闭占用 CDP 端口的 Chrome 后重试。",
+                    status=502,
+                    retryable=True,
+                ),
+                output=output,
+                login=True,
+            )
         return {
-            "success": rc == 0,
-            "login_started": rc == 0 or "LOGIN_READY" in output,
-            "message": "已打开小红书登录页面，请扫码登录" if rc == 0 else "打开登录页面失败",
-            "output": output,
+            "success": True,
+            "login_started": not logged_in,
+            "logged_in": logged_in,
+            "authenticated": logged_in,
+            "login_url": XHS_CREATOR_LOGIN_URL,
+            "qrcode_data_url": "" if logged_in else qrcode_data_url,
+            "mime_type": payload.get("mime_type", "image/png"),
+            "message": "已登录小红书" if logged_in else "登录二维码已准备好，请扫码登录",
+            "output": "",
             "returncode": rc,
         }
 
     def _run_prepare(self, task_id: str) -> None:
         task = self.get_task(task_id)
-        if not task:
+        if not task or self._task_cancelled(task_id):
             return
         self._set_status(task_id, "validating")
+        if self._task_cancelled(task_id):
+            return
         try:
             images = self._ordered_images(task["record_id"])
         except PublishServiceError as exc:
+            if self._task_cancelled(task_id):
+                return
             self._set_status(task_id, "failed", error=exc.app_error.to_dict())
             return
         config = self.get_config()
@@ -514,9 +859,13 @@ class PublishService:
         if task["mode"] == "preview":
             execution_config["headless"] = False
         try:
-            logged_in, rc, output = self._check_login(execution_config)
+            logged_in, rc, output = self._check_login(execution_config, task_id=task_id)
         except Exception as exc:
+            if self._task_cancelled(task_id):
+                return
             self._set_status(task_id, "failed", error=str(exc))
+            return
+        if self._task_cancelled(task_id):
             return
         if not logged_in:
             self._set_status(task_id, "auth_required", output=output, error="请先登录小红书账号。")
@@ -533,6 +882,8 @@ class PublishService:
         try:
             script = self._require_script("publish_pipeline.py")
         except PublishServiceError as exc:
+            if self._task_cancelled(task_id):
+                return
             self._set_status(task_id, "failed", error=exc.app_error.to_dict())
             return
         # 预览的目的就是让用户在可见浏览器中检查内容；即使系统默认配置为
@@ -542,9 +893,13 @@ class PublishService:
             args.append("--preview")
         args.extend(["--title", task["title"], "--content", content, "--images", *images])
         try:
-            rc, stdout, stderr = self._run_command(args)
+            rc, stdout, stderr = self._run_command_for_task(args, task_id=task_id)
         except TimeoutError as exc:
+            if self._task_cancelled(task_id):
+                return
             self._set_status(task_id, "unknown", error=str(exc))
+            return
+        if self._task_cancelled(task_id):
             return
         output = self._combine_output(stdout, stderr)
         url = self._extract_note_url(output)
@@ -565,19 +920,25 @@ class PublishService:
 
     def _run_confirm(self, task_id: str) -> None:
         task = self.get_task(task_id)
-        if not task:
+        if not task or self._task_cancelled(task_id):
             return
         config = self.get_config()
         try:
             script = self._require_script("cdp_publish.py")
         except PublishServiceError as exc:
+            if self._task_cancelled(task_id):
+                return
             self._set_status(task_id, "failed", error=exc.app_error.to_dict())
             return
         args = [sys.executable, str(script), *self._command_options(config), "click-publish"]
         try:
-            rc, stdout, stderr = self._run_command(args)
+            rc, stdout, stderr = self._run_command_for_task(args, task_id=task_id)
         except TimeoutError as exc:
+            if self._task_cancelled(task_id):
+                return
             self._set_status(task_id, "unknown", error=str(exc))
+            return
+        if self._task_cancelled(task_id):
             return
         output = self._combine_output(stdout, stderr)
         url = self._extract_note_url(output)
@@ -591,6 +952,10 @@ class PublishService:
     def close(self) -> None:
         self._stop_event.set()
         self._queue.put(None)
+        with self._lock:
+            processes = list(self._active_processes.values())
+        for process in processes:
+            self._terminate_process(process)
         if self._worker and self._worker.is_alive():
             self._worker.join(timeout=2)
 

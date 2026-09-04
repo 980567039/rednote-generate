@@ -1,14 +1,16 @@
 import axios from 'axios'
 import { API_BASE_URL } from './client'
-import type { OutlineResponse } from './types'
+import type { OutlineResponse, SeriesRequestContext } from './types'
 
 export async function generateOutline(
   topic: string,
-  images?: File[]
+  images?: File[],
+  series?: SeriesRequestContext
 ): Promise<OutlineResponse & { has_images?: boolean }> {
   if (images && images.length > 0) {
     const formData = new FormData()
     formData.append('topic', topic)
+    Object.entries(series || {}).forEach(([key, value]) => formData.append(key, String(value)))
     images.forEach((file) => {
       formData.append('images', file)
     })
@@ -26,7 +28,8 @@ export async function generateOutline(
   }
 
   const response = await axios.post<OutlineResponse>(`${API_BASE_URL}/outline`, {
-    topic
+    topic,
+    ...(series || {})
   })
   return response.data
 }

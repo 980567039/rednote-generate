@@ -1,4 +1,5 @@
 from flask import Flask
+import subprocess
 
 from backend.routes.publish_routes import create_publish_blueprint
 from tests.publish_service_test import make_service
@@ -57,6 +58,21 @@ def test_publish_requires_explicit_confirmation_and_blocks_duplicate(tmp_path):
     assert duplicate.get_json()["error"]["code"] == "CONFLICT"
 
 
+def test_publish_cancel_route_stops_queued_task(tmp_path):
+    client, _ = make_client(tmp_path)
+    response = client.post(
+        "/api/history/record_1/publish",
+        json={"title": "取消测试", "copywriting": "测试正文", "tags": [], "mode": "preview", "confirm": True},
+    )
+    assert response.status_code == 202
+    task_id = response.get_json()["task"]["id"]
+
+    response = client.post(f"/api/publish/tasks/{task_id}/cancel", json={})
+
+    assert response.status_code == 200
+    assert response.get_json()["task"]["status"] == "cancelled"
+
+
 def test_publish_auth_contract(tmp_path):
     calls = []
 
@@ -67,10 +83,13 @@ def test_publish_auth_contract(tmp_path):
 
     def runner(args, **kwargs):
         calls.append((args, kwargs))
-        if args[-1] == "login":
+        if "get-login-qrcode" in args:
             result = Result()
             result.returncode = 0
-            result.stdout = "LOGIN_READY"
+            result.stdout = (
+                'GET_LOGIN_QRCODE_RESULT:\n'
+                '{"logged_in": false, "qrcode_data_url": "data:image/png;base64,cXI=", "mime_type": "image/png"}'
+            )
             return result
         return Result()
 
@@ -84,8 +103,33 @@ def test_publish_auth_contract(tmp_path):
     response = client.post("/api/publish/auth/login")
     assert response.status_code == 200
     assert response.get_json()["login_started"] is True
+    assert response.get_json()["login_url"] == "https://creator.xiaohongshu.com/login"
+    assert response.get_json()["qrcode_data_url"].startswith("data:image/png;base64,")
     assert response.get_json()["message"]
     assert all(kwargs["shell"] is False for _, kwargs in calls)
+
+
+def test_publish_auth_routes_keep_domain_error_codes(tmp_path):
+    def timeout_runner(args, **kwargs):
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+    client, _ = make_client(tmp_path, runner=timeout_runner)
+    cases = [
+        ("/api/publish/auth/check", "PUBLISH_AUTH_CHECK_TIMEOUT"),
+        ("/api/publish/auth/login", "PUBLISH_LOGIN_TIMEOUT"),
+    ]
+
+    for endpoint, expected_code in cases:
+        response = client.post(endpoint)
+        payload = response.get_json()
+        assert response.status_code == 504
+        assert payload["success"] is False
+        assert payload["error"]["code"] == expected_code
+        assert payload["error_message"]
+        serialized = str(payload).lower()
+        assert "topic" not in serialized
+        assert "series" not in serialized
+        assert "主题候选" not in serialized
 
 
 def test_missing_publish_task_uses_standard_error_shape(tmp_path):

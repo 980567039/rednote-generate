@@ -14,6 +14,17 @@ class ImageResponseExtractor:
         self.download_image = download_image
 
     def extract_from_images_response(self, result: Dict[str, Any]) -> bytes:
+        # 部分代理在 HTTP 200 时也会把上游拒绝放在 error 字段中，
+        # 不能继续用“缺少 data”覆盖真正原因（例如 moderation_blocked）。
+        error = result.get("error") if isinstance(result, dict) else None
+        if error:
+            if isinstance(error, dict):
+                message = error.get("message") or error.get("detail") or error.get("type") or str(error)
+                code = error.get("code") or error.get("type")
+                suffix = f"（{code}）" if code and str(code) not in str(message) else ""
+                raise ValueError(f"图片接口拒绝请求：{message}{suffix}")
+            raise ValueError(f"图片接口拒绝请求：{error}")
+
         data = result.get("data")
         if not isinstance(data, list) or not data:
             raise ValueError(

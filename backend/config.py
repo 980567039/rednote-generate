@@ -12,8 +12,28 @@ class Config:
     # Docker 显式设置 FLASK_HOST=0.0.0.0 后仍可按原方式对外提供容器端口。
     HOST = os.getenv('FLASK_HOST', '127.0.0.1')
     PORT = int(os.getenv('FLASK_PORT', '12398'))
-    CORS_ORIGINS = ['http://localhost:5173', 'http://localhost:3000']
+    CORS_ORIGINS = [
+        origin.strip().rstrip('/')
+        for origin in os.getenv(
+            'REDINK_CORS_ORIGINS',
+            ','.join([
+                'http://localhost:5173',
+                'http://127.0.0.1:5173',
+                'http://localhost:3000',
+                'http://127.0.0.1:3000',
+            ]),
+        ).split(',')
+        if origin.strip()
+    ]
     OUTPUT_DIR = 'output'
+    AUTH_DB_PATH = os.getenv(
+        'REDINK_AUTH_DB',
+        str(Path(__file__).parent.parent / 'data' / 'auth.sqlite3'),
+    )
+    AUTH_COOKIE_NAME = os.getenv('REDINK_AUTH_COOKIE', 'redink_session')
+    AUTH_COOKIE_SECURE = os.getenv(
+        'REDINK_AUTH_COOKIE_SECURE', 'false'
+    ).lower() in {'1', 'true', 'yes', 'on'}
 
     _image_providers_config = None
     _text_providers_config = None

@@ -52,7 +52,7 @@ COPY docker/image_providers.yaml ./
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
 # 创建数据目录
-RUN mkdir -p output history
+RUN mkdir -p output history data
 
 # 设置环境变量
 ENV FLASK_DEBUG=False

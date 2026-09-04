@@ -9,12 +9,16 @@ import os
 import json
 import uuid
 import logging
+import io
 import tempfile
+import re
 from threading import RLock
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 from enum import Enum
+
+from PIL import Image
 
 from backend.services.history_image_merger import HistoryImageMerger
 
@@ -38,6 +42,10 @@ class ContentStatus:
     DONE = "done"
     ERROR = "error"
     VALUES = {IDLE, GENERATING, DONE, ERROR}
+
+
+class HistoryPageDeletionConflictError(ValueError):
+    """Raised when deleting a page would leave another page unusable."""
 
 
 class HistoryService:
@@ -224,7 +232,18 @@ class HistoryService:
         self,
         topic: str,
         outline: Dict,
-        task_id: Optional[str] = None
+        task_id: Optional[str] = None,
+        series_id: Optional[str] = None,
+        series_project_id: Optional[str] = None,
+        series_template_id: Optional[str] = None,
+        series_item_index: Optional[int] = None,
+        series_item_title: Optional[str] = None,
+        series_item_id: Optional[str] = None,
+        series_template_revision: Optional[int] = None,
+        series_template_snapshot: Optional[Dict[str, Any]] = None,
+        series_context_snapshot: Optional[str] = None,
+        series_topic_source: Optional[str] = None,
+        series_content_mode: Optional[str] = None,
     ) -> str:
         """
         创建新的历史记录
@@ -256,12 +275,35 @@ class HistoryService:
                 "outline": outline,  # 保存完整的大纲数据
                 "images": {
                     "task_id": task_id,
-                    "generated": []  # 初始无生成图片
+                    "generated": [],  # 初始无生成图片
                 },
                 "content": self._empty_content(),
                 "status": RecordStatus.DRAFT,  # 初始状态：草稿
                 "thumbnail": None  # 初始无缩略图
             }
+            # 系列元数据是可选的；旧历史记录和自由创作不需要迁移。
+            if series_id is not None:
+                record["series_id"] = series_id
+            if series_project_id is not None:
+                record["series_project_id"] = series_project_id
+            if series_template_id is not None:
+                record["series_template_id"] = series_template_id
+            if series_item_index is not None:
+                record["series_item_index"] = series_item_index
+            if series_item_title is not None:
+                record["series_item_title"] = series_item_title
+            if series_item_id is not None:
+                record["series_item_id"] = series_item_id
+            if series_template_revision is not None:
+                record["series_template_revision"] = series_template_revision
+            if series_template_snapshot is not None:
+                record["series_template_snapshot"] = series_template_snapshot
+            if series_context_snapshot is not None:
+                record["series_context_snapshot"] = series_context_snapshot
+            if series_topic_source is not None:
+                record["series_topic_source"] = series_topic_source
+            if series_content_mode is not None:
+                record["series_content_mode"] = series_content_mode
 
             # 保存完整记录到独立文件
             record_path = self._get_record_path(record_id)
@@ -269,7 +311,7 @@ class HistoryService:
 
             # 更新索引（用于快速列表查询）
             index = self._load_index()
-            index["records"].insert(0, {
+            index_entry = {
                 "id": record_id,
                 "title": topic,
                 "created_at": now,
@@ -278,7 +320,19 @@ class HistoryService:
                 "thumbnail": None,
                 "page_count": len(outline.get("pages", [])),  # 预期页数
                 "task_id": task_id
-            })
+            }
+            if series_id is not None:
+                index_entry.update({
+                    "series_id": series_id,
+                    "series_project_id": series_project_id,
+                    "series_template_id": series_template_id,
+                    "series_item_index": series_item_index,
+                    "series_item_title": series_item_title,
+                    "series_item_id": series_item_id,
+                    "series_template_revision": series_template_revision,
+                    "series_content_mode": series_content_mode,
+                })
+            index["records"].insert(0, index_entry)
             self._save_index(index)
 
             return record_id
@@ -473,12 +527,15 @@ class HistoryService:
             status = HistoryImageMerger.compute_status(generated, total_count)
             thumbnail = HistoryImageMerger.first_image(generated)
 
+            image_payload = {
+                "task_id": task_id,
+                "generated": generated,
+                # 显式清除当前页的旧错误；空 errors 字典仍会被安全合并并省略保存。
+                "errors": {str(page_index): None},
+            }
             return self.update_record(
                 record_id,
-                images={
-                    "task_id": task_id,
-                    "generated": generated,
-                },
+                images=image_payload,
                 status=status,
                 thumbnail=thumbnail,
             )
@@ -497,6 +554,7 @@ class HistoryService:
             images={
                 "task_id": task_id,
                 "generated": [] if is_new_task else images.get("generated") or [],
+                "errors": {} if is_new_task else images.get("errors") or {},
             },
             status=RecordStatus.GENERATING,
         )
@@ -517,6 +575,228 @@ class HistoryService:
             )
             return False
         return self.update_record(record_id, status=status)
+
+    def append_pattern_image(
+        self,
+        record_id: str,
+        request_id: str,
+        image_data: bytes,
+        source_image_index: int,
+        columns: int,
+        rows: int,
+        used_colors: int,
+        beads_data: Optional[bytes] = None,
+        ironed_data: Optional[bytes] = None,
+    ) -> Dict[str, Any]:
+        """幂等地把 Perler 母版和可选效果图追加为历史记录的最后一页。
+
+        ``pattern`` 是页面主图，``beads`` 和 ``ironed`` 只是该页面的
+        附属输出，因此不会写入 ``images.generated``，也不会改变页面索引。
+        旧客户端只上传 ``pattern`` 时仍按原协议工作；同一个 request_id
+        后续补交效果图时，会在已有页面上幂等地补齐缺失资源。
+        """
+        with self._ensure_lock():
+            record = self.get_record(record_id)
+            if not record:
+                raise FileNotFoundError("历史记录不存在")
+
+            images = dict(record.get("images") or {})
+            pattern_requests = dict(images.get("pattern_requests") or {})
+            existing = pattern_requests.get(request_id)
+
+            # 兼容旧客户端的重试：没有附属文件时不再读取/校验无关的
+            # pattern 内容。若后续带来了效果图，则继续向下补齐缺失输出。
+            if (
+                isinstance(existing, dict)
+                and existing.get("filename")
+                and beads_data is None
+                and ironed_data is None
+            ):
+                return {
+                    "record": record,
+                    "appended": False,
+                    "page_index": existing.get("page_index"),
+                    "filename": existing["filename"],
+                    "outputs": dict(existing.get("outputs") or {}),
+                }
+
+            if not image_data or len(image_data) > 20 * 1024 * 1024:
+                raise ValueError("拼豆图纸文件为空或超过 20MB")
+            if not all(isinstance(value, int) and value >= 1 for value in (columns, rows)):
+                raise ValueError("拼豆图纸网格尺寸无效")
+            if columns > 300 or rows > 300:
+                raise ValueError("拼豆图纸网格尺寸不能超过 300×300")
+            if not isinstance(used_colors, int) or not 1 <= used_colors <= 64:
+                raise ValueError("拼豆图纸用色数量无效")
+            if not isinstance(source_image_index, int) or source_image_index < 0:
+                raise ValueError("来源图片索引无效")
+
+            def validate_png(data: Optional[bytes], label: str, max_bytes: int) -> None:
+                if data is None:
+                    return
+                if not data or len(data) > max_bytes:
+                    raise ValueError(f"{label}文件为空或超过 {max_bytes // (1024 * 1024)}MB")
+                try:
+                    with Image.open(io.BytesIO(data)) as image:
+                        if image.format != "PNG":
+                            raise ValueError(f"只允许追加 PNG {label}")
+                        if image.width * image.height > 64_000_000:
+                            raise ValueError(f"{label}像素面积超过安全上限")
+                        image.verify()
+                    with Image.open(io.BytesIO(data)) as image:
+                        image.load()
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    raise ValueError(f"{label}不是有效的 PNG 文件") from exc
+
+            # 保留旧接口对母版的错误文案，避免旧客户端/测试依赖其语义。
+            validate_png(image_data, "拼豆母版", 20 * 1024 * 1024)
+            validate_png(beads_data, "拼豆实物效果图", 10 * 1024 * 1024)
+            validate_png(ironed_data, "熨烫成品效果图", 10 * 1024 * 1024)
+
+            task_id = images.get("task_id")
+            if not isinstance(task_id, str) or not task_id or os.path.basename(task_id) != task_id:
+                raise ValueError("历史记录没有安全的图片任务目录")
+            task_dir = os.path.realpath(os.path.join(self.history_dir, task_id))
+            history_root = os.path.realpath(self.history_dir)
+            if os.path.commonpath([history_root, task_dir]) != history_root or not os.path.isdir(task_dir):
+                raise ValueError("历史记录图片目录不存在")
+
+            def save_asset(data: bytes, prefix: str) -> str:
+                filename = f"{prefix}_{uuid.uuid4().hex}.png"
+                temporary_path = None
+                try:
+                    fd, temporary_path = tempfile.mkstemp(prefix=f".{prefix}-", suffix=".png", dir=task_dir)
+                    with os.fdopen(fd, "wb") as image_file:
+                        image_file.write(data)
+                        image_file.flush()
+                        os.fsync(image_file.fileno())
+                    os.replace(temporary_path, os.path.join(task_dir, filename))
+                    temporary_path = None
+                finally:
+                    if temporary_path:
+                        try:
+                            os.unlink(temporary_path)
+                        except FileNotFoundError:
+                            pass
+                return filename
+
+            outline = dict(record.get("outline") or {})
+            raw_pages = outline.get("pages")
+            pages = list(raw_pages) if isinstance(raw_pages, list) else []
+            generated = list(images.get("generated") or [])
+            if isinstance(existing, dict) and existing.get("filename"):
+                page_index = existing.get("page_index")
+                if not isinstance(page_index, int) or page_index < 0 or page_index >= len(pages):
+                    raise ValueError("历史记录中的拼豆页面索引无效")
+                page = pages[page_index]
+                if not isinstance(page, dict) or page.get("type") != "pattern":
+                    raise ValueError("历史记录中的拼豆页面无效")
+                raw_pattern_meta = page.get("pattern")
+                pattern_meta = dict(raw_pattern_meta) if isinstance(raw_pattern_meta, dict) else {}
+                outputs = dict(pattern_meta.get("outputs") or {})
+                # 只补齐缺失的资源，避免同一 request_id 重试产生孤儿文件。
+                outputs_changed = False
+                if beads_data is not None and not outputs.get("beads"):
+                    outputs["beads"] = save_asset(beads_data, "pattern_beads")
+                    outputs_changed = True
+                if ironed_data is not None and not outputs.get("ironed"):
+                    outputs["ironed"] = save_asset(ironed_data, "pattern_ironed")
+                    outputs_changed = True
+                if outputs_changed:
+                    pattern_meta["outputs"] = outputs
+                    page["pattern"] = pattern_meta
+                    pages[page_index] = page
+                    outline["pages"] = pages
+                    record["outline"] = outline
+                    existing = {**existing, "outputs": outputs}
+                    pattern_requests[request_id] = existing
+                    images["pattern_requests"] = pattern_requests
+                    record["images"] = images
+                    record["updated_at"] = datetime.now().isoformat()
+                    self._atomic_write_json(self._get_record_path(record_id), record)
+                    index = self._load_index()
+                    for index_record in index.get("records", []):
+                        if index_record.get("id") == record_id:
+                            index_record["updated_at"] = record["updated_at"]
+                            break
+                    self._save_index(index)
+                return {
+                    "record": record,
+                    "appended": False,
+                    "page_index": page_index,
+                    "filename": existing["filename"],
+                    "outputs": outputs,
+                }
+
+            if len(generated) != len(pages):
+                raise ValueError("历史记录页面和图片数量不一致，请先同步历史记录")
+            source_page = pages[source_image_index] if source_image_index < len(pages) else None
+            if not isinstance(source_page, dict) or source_page.get("type") == "pattern":
+                raise ValueError("来源图片索引必须指向已有的原始图片页面")
+
+            page_index = len(pages)
+            filename = save_asset(image_data, "pattern")
+            outputs: Dict[str, str] = {}
+            if beads_data is not None:
+                outputs["beads"] = save_asset(beads_data, "pattern_beads")
+            if ironed_data is not None:
+                outputs["ironed"] = save_asset(ironed_data, "pattern_ironed")
+
+            page = {
+                "index": page_index,
+                "type": "pattern",
+                "content": (
+                    f"拼豆图纸母版｜来源第 {source_image_index + 1} 张图片｜"
+                    f"{columns}×{rows} 格｜{used_colors} 色"
+                ),
+                "pattern": {
+                    "source_image_index": source_image_index,
+                    "columns": columns,
+                    "rows": rows,
+                    "used_colors": used_colors,
+                    **({"outputs": outputs} if outputs else {}),
+                },
+            }
+            pages.append(page)
+            generated.append(filename)
+            outline["pages"] = pages
+            raw_outline = outline.get("raw")
+            page_text = f"[拼豆图纸]\n{page['content']}"
+            outline["raw"] = f"{raw_outline.rstrip()}\n\n<page>\n\n{page_text}" if isinstance(raw_outline, str) and raw_outline.strip() else page_text
+
+            images["generated"] = generated
+            images["pattern_requests"] = {
+                **pattern_requests,
+                request_id: {
+                    "filename": filename,
+                    "page_index": page_index,
+                    **({"outputs": outputs} if outputs else {}),
+                },
+            }
+            record["outline"] = outline
+            record["images"] = images
+            record["updated_at"] = datetime.now().isoformat()
+            record["status"] = HistoryImageMerger.compute_status(generated, len(pages))
+            self._atomic_write_json(self._get_record_path(record_id), record)
+
+            index = self._load_index()
+            for index_record in index.get("records", []):
+                if index_record.get("id") == record_id:
+                    index_record["updated_at"] = record["updated_at"]
+                    index_record["status"] = record["status"]
+                    index_record["page_count"] = len(pages)
+                    index_record["thumbnail"] = record.get("thumbnail")
+                    break
+            self._save_index(index)
+            return {
+                "record": record,
+                "appended": True,
+                "page_index": page_index,
+                "filename": filename,
+                "outputs": outputs,
+            }
 
     def sync_record_images(self, record_id: str, record: Optional[Dict] = None) -> Dict[str, Any]:
         """从任务目录扫描图片并合并回历史记录。"""
@@ -574,6 +854,10 @@ class HistoryService:
 
         current_generated = current.get("generated") or []
         incoming_generated = incoming.get("generated")
+        current_errors = dict(current.get("errors") or {})
+        incoming_errors = incoming.get("errors")
+        current_pattern_requests = dict(current.get("pattern_requests") or {})
+        incoming_pattern_requests = incoming.get("pattern_requests")
 
         # 显式绑定一个不同的新任务且传入空列表，表示开始一次全新生成。
         # 此时必须清空旧任务的图片；否则编辑页数或 force 重生成会继续显示
@@ -597,10 +881,31 @@ class HistoryService:
         if not incoming.get("task_id") and current.get("task_id"):
             incoming["task_id"] = current.get("task_id")
 
-        return {
+        if starts_new_task:
+            merged_errors = dict(incoming_errors or {}) if isinstance(incoming_errors, dict) else {}
+            merged_pattern_requests = dict(incoming_pattern_requests or {}) if isinstance(incoming_pattern_requests, dict) else current_pattern_requests
+        else:
+            merged_errors = current_errors
+            if isinstance(incoming_errors, dict):
+                for key, value in incoming_errors.items():
+                    key = str(key)
+                    if value in (None, ""):
+                        merged_errors.pop(key, None)
+                    else:
+                        merged_errors[key] = value
+            merged_pattern_requests = current_pattern_requests
+            if isinstance(incoming_pattern_requests, dict):
+                merged_pattern_requests.update(incoming_pattern_requests)
+
+        result = {
             "task_id": incoming.get("task_id"),
             "generated": [item or "" for item in incoming.get("generated", current_generated)],
         }
+        if merged_errors:
+            result["errors"] = merged_errors
+        if merged_pattern_requests:
+            result["pattern_requests"] = merged_pattern_requests
+        return result
 
     def _protect_status(self, current_status: Optional[str], incoming_status: str, record: Dict) -> str:
         if (
@@ -611,6 +916,430 @@ class HistoryService:
             logger.info("忽略历史状态回退: %s -> %s", current_status, incoming_status)
             return current_status
         return incoming_status
+
+    @staticmethod
+    def _safe_task_asset_path(task_dir: Optional[str], filename: Any) -> Optional[str]:
+        """Return an asset path only when ``filename`` is a plain task-local file.
+
+        History files are normally generated by the application, but old records
+        can contain user-edited metadata.  Deletion must never follow a path out
+        of the task directory (or delete a directory), so malformed references
+        are ignored and left for a later manual cleanup.
+        """
+        if not task_dir or not isinstance(filename, str) or not filename:
+            return None
+        if os.path.basename(filename) != filename or filename in {".", ".."}:
+            return None
+        candidate = os.path.realpath(os.path.join(task_dir, filename))
+        task_root = os.path.realpath(task_dir)
+        try:
+            if os.path.commonpath([task_root, candidate]) != task_root:
+                return None
+        except ValueError:
+            return None
+        return candidate
+
+    @staticmethod
+    def _outline_raw_without_page(
+        raw_outline: Any,
+        pages: List[Dict[str, Any]],
+        removed_index: int,
+        previous_count: int,
+    ) -> str:
+        """Remove one page from the serialized outline without losing text.
+
+        Newer records use ``<page>`` separators, while some legacy records only
+        have a raw string.  Prefer removing the matching separator segment; if
+        the raw text is inconsistent, rebuilding from page content gives callers
+        a deterministic, page-aligned value instead of retaining deleted text.
+        """
+        if isinstance(raw_outline, str):
+            parts = re.split(r"\n\s*<page>\s*\n", raw_outline)
+            if len(parts) == previous_count and 0 <= removed_index < len(parts):
+                del parts[removed_index]
+                return "\n\n<page>\n\n".join(parts)
+        return "\n\n<page>\n\n".join(
+            str(page.get("content") or "") if isinstance(page, dict) else str(page or "")
+            for page in pages
+        )
+
+    @classmethod
+    def _reindex_numeric_assets(
+        cls,
+        task_dir: Optional[str],
+        generated: List[str],
+        pages: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Align numeric original-image filenames with their new page indexes.
+
+        The image scanner treats ``1.png`` as page 1.  After deleting page 0,
+        merely shifting metadata would make a later scan resurrect the old
+        index.  Rename existing numeric original assets through temporary files
+        so destinations can safely overlap sources; non-numeric and pattern
+        assets keep their stable names.
+        """
+        desired = list(generated)
+        moves: List[tuple[str, str, str]] = []
+        if task_dir:
+            source_paths = set()
+            for index, page in enumerate(pages):
+                if not isinstance(page, dict) or page.get("type") == "pattern":
+                    continue
+                filename = generated[index] if index < len(generated) else ""
+                if not isinstance(filename, str) or not filename:
+                    continue
+                stem, extension = os.path.splitext(filename)
+                if not stem.isdigit() or not extension:
+                    continue
+                desired_name = f"{index}{extension}"
+                if desired_name == filename:
+                    continue
+                source_path = cls._safe_task_asset_path(task_dir, filename)
+                destination_path = cls._safe_task_asset_path(task_dir, desired_name)
+                if not source_path or not destination_path:
+                    continue
+                if not os.path.isfile(source_path):
+                    # Keep metadata deterministic even when a failed image has
+                    # no corresponding file on disk.
+                    desired[index] = desired_name
+                    continue
+                source_paths.add(source_path)
+                moves.append((source_path, destination_path, desired_name))
+
+            # Never overwrite a non-moving asset (for example a custom-named
+            # pattern output that happens to be ``0.png``).
+            for source_path, destination_path, _ in moves:
+                if os.path.exists(destination_path) and destination_path not in source_paths:
+                    return generated
+
+            staged: List[tuple[str, str, str]] = []
+            placed: List[tuple[str, str]] = []
+            thumbnail_data: List[tuple[str, str, bytes]] = []
+            for source_path, destination_path, _ in moves:
+                source_thumb = os.path.join(os.path.dirname(source_path), f"thumb_{os.path.basename(source_path)}")
+                destination_thumb = os.path.join(os.path.dirname(destination_path), f"thumb_{os.path.basename(destination_path)}")
+                try:
+                    if os.path.isfile(source_thumb):
+                        with open(source_thumb, "rb") as thumbnail_file:
+                            thumbnail_data.append((source_thumb, destination_thumb, thumbnail_file.read()))
+                except OSError:
+                    continue
+            try:
+                for source_path, destination_path, desired_name in moves:
+                    fd, temporary_path = tempfile.mkstemp(
+                        prefix=".reindex-", suffix=".png", dir=task_dir
+                    )
+                    os.close(fd)
+                    os.unlink(temporary_path)
+                    os.replace(source_path, temporary_path)
+                    staged.append((temporary_path, source_path, destination_path))
+                for temporary_path, source_path, destination_path in staged:
+                    os.replace(temporary_path, destination_path)
+                    placed.append((destination_path, source_path))
+                for source_thumb, destination_thumb, data in thumbnail_data:
+                    fd, temporary_path = tempfile.mkstemp(
+                        prefix=".reindex-thumb-", suffix=".png", dir=task_dir
+                    )
+                    try:
+                        with os.fdopen(fd, "wb") as thumbnail_file:
+                            thumbnail_file.write(data)
+                            thumbnail_file.flush()
+                            os.fsync(thumbnail_file.fileno())
+                        os.replace(temporary_path, destination_thumb)
+                    finally:
+                        if os.path.exists(temporary_path):
+                            os.unlink(temporary_path)
+                thumbnail_destinations = {destination for _, destination, _ in thumbnail_data}
+                for source_thumb, _, _ in thumbnail_data:
+                    if source_thumb not in thumbnail_destinations and os.path.isfile(source_thumb):
+                        os.remove(source_thumb)
+                for index, page in enumerate(pages):
+                    if not isinstance(page, dict) or page.get("type") == "pattern":
+                        continue
+                    filename = generated[index] if index < len(generated) else ""
+                    if not isinstance(filename, str) or not filename:
+                        continue
+                    stem, extension = os.path.splitext(filename)
+                    if stem.isdigit() and extension:
+                        desired[index] = f"{index}{extension}"
+            except OSError:
+                # Best-effort rollback for a partially staged operation.  If a
+                # destination has already moved, leaving metadata unchanged is
+                # safer than pointing at a path that no longer exists.
+                for destination_path, source_path in reversed(placed):
+                    try:
+                        if os.path.exists(destination_path):
+                            os.replace(destination_path, source_path)
+                    except OSError:
+                        pass
+                for temporary_path, source_path, _ in reversed(staged[len(placed):]):
+                    try:
+                        if os.path.exists(temporary_path):
+                            os.replace(temporary_path, source_path)
+                    except OSError:
+                        pass
+                return generated
+        else:
+            for index, page in enumerate(pages):
+                if not isinstance(page, dict) or page.get("type") == "pattern":
+                    continue
+                filename = generated[index] if index < len(generated) else ""
+                if not isinstance(filename, str) or not filename:
+                    continue
+                stem, extension = os.path.splitext(filename)
+                if stem.isdigit() and extension:
+                    desired[index] = f"{index}{extension}"
+        return desired
+
+    def delete_page(self, record_id: str, page_index: int) -> Dict[str, Any]:
+        """Delete one generated page and its task-local assets.
+
+        Pattern pages can always be removed.  An original page that is still
+        referenced by a pattern page is rejected rather than cascading the
+        pattern deletion; this keeps a construction chart's source relationship
+        explicit and prevents accidental loss of a user's chart.
+        """
+        with self._ensure_lock():
+            record = self.get_record(record_id)
+            if not record:
+                raise FileNotFoundError("历史记录不存在")
+            if not isinstance(page_index, int) or isinstance(page_index, bool) or page_index < 0:
+                raise ValueError("页面索引无效")
+
+            if record.get("status") == RecordStatus.GENERATING:
+                raise HistoryPageDeletionConflictError(
+                    "图片任务仍在生成，请等待任务结束后再删除页面"
+                )
+
+            outline = dict(record.get("outline") or {})
+            pages = list(outline.get("pages") or [])
+            previous_count = len(pages)
+            if page_index >= previous_count:
+                raise ValueError("页面不存在")
+
+            target_page = pages[page_index]
+            if not isinstance(target_page, dict):
+                raise ValueError("历史记录中的页面无效")
+            target_type = target_page.get("type")
+            if target_type != "pattern":
+                # A source image may not be removed while a chart still points
+                # to it.  We intentionally reject rather than silently cascade.
+                for page in pages:
+                    if not isinstance(page, dict) or page.get("type") != "pattern":
+                        continue
+                    metadata = page.get("pattern")
+                    source_index = metadata.get("source_image_index") if isinstance(metadata, dict) else None
+                    if source_index == page_index:
+                        raise HistoryPageDeletionConflictError(
+                            "该图片仍被拼豆图纸引用，请先删除关联图纸后再删除图片"
+                        )
+
+            raw_images = record.get("images")
+            images = dict(raw_images) if isinstance(raw_images, dict) else {}
+            raw_generated = images.get("generated")
+            generated = [item or "" for item in raw_generated] if isinstance(raw_generated, list) else []
+            # Keep the persisted image list page-aligned even for older records
+            # whose generated list was shorter/longer than outline.pages.
+            if len(generated) < previous_count:
+                generated.extend([""] * (previous_count - len(generated)))
+            elif len(generated) > previous_count:
+                generated = generated[:previous_count]
+
+            removed_filename = generated[page_index]
+            removed_files = set()
+            if isinstance(removed_filename, str) and removed_filename:
+                removed_files.add(removed_filename)
+
+            pattern_metadata = target_page.get("pattern")
+            if isinstance(pattern_metadata, dict):
+                target_outputs = pattern_metadata.get("outputs")
+                if isinstance(target_outputs, dict):
+                    removed_files.update(
+                        value for value in target_outputs.values()
+                        if isinstance(value, str) and value
+                    )
+
+            raw_pattern_requests = images.get("pattern_requests")
+            pattern_requests = (
+                dict(raw_pattern_requests)
+                if isinstance(raw_pattern_requests, dict)
+                else {}
+            )
+            remaining_requests: Dict[str, Any] = {}
+            for request_id, raw_request in pattern_requests.items():
+                if not isinstance(raw_request, dict):
+                    remaining_requests[request_id] = raw_request
+                    continue
+                request_page_index = raw_request.get("page_index")
+                request_files = {
+                    value for key, value in raw_request.items()
+                    if key in {"filename", "beads", "ironed"}
+                    and isinstance(value, str)
+                    and value
+                }
+                request_outputs = raw_request.get("outputs")
+                if isinstance(request_outputs, dict):
+                    request_files.update(
+                        value for value in request_outputs.values()
+                        if isinstance(value, str) and value
+                    )
+                if request_page_index == page_index:
+                    removed_files.update(request_files)
+                    continue
+                next_request = dict(raw_request)
+                if isinstance(request_page_index, int) and request_page_index > page_index:
+                    next_request["page_index"] = request_page_index - 1
+                remaining_requests[request_id] = next_request
+
+            pages.pop(page_index)
+            generated.pop(page_index)
+
+            # Reindex pages and source references after the removed slot.  A
+            # pattern page normally lives at the end, but doing this generally
+            # keeps old/hand-edited records consistent as well.
+            for next_index, page in enumerate(pages):
+                if not isinstance(page, dict):
+                    continue
+                page["index"] = next_index
+                if page.get("type") == "pattern" and isinstance(page.get("pattern"), dict):
+                    metadata = dict(page["pattern"])
+                    source_index = metadata.get("source_image_index")
+                    if isinstance(source_index, int) and source_index > page_index:
+                        metadata["source_image_index"] = source_index - 1
+                    page["pattern"] = metadata
+
+            raw_errors = images.get("errors")
+            errors = dict(raw_errors) if isinstance(raw_errors, dict) else {}
+            shifted_errors: Dict[str, Any] = {}
+            for raw_index, error in errors.items():
+                try:
+                    old_index = int(raw_index)
+                except (TypeError, ValueError):
+                    shifted_errors[str(raw_index)] = error
+                    continue
+                if old_index == page_index:
+                    continue
+                shifted_errors[str(old_index - 1 if old_index > page_index else old_index)] = error
+
+            # Do not remove an asset that another page/request still references,
+            # even if a legacy record happened to reuse the same filename.
+            remaining_files = {
+                value for value in generated
+                if isinstance(value, str) and value
+            }
+            for page in pages:
+                if not isinstance(page, dict) or page.get("type") != "pattern":
+                    continue
+                metadata = page.get("pattern")
+                outputs = metadata.get("outputs") if isinstance(metadata, dict) else None
+                if isinstance(outputs, dict):
+                    remaining_files.update(
+                        value for value in outputs.values()
+                        if isinstance(value, str) and value
+                    )
+            for raw_request in remaining_requests.values():
+                if not isinstance(raw_request, dict):
+                    continue
+                remaining_files.update(
+                    value for key, value in raw_request.items()
+                    if key in {"filename", "beads", "ironed"}
+                    and isinstance(value, str)
+                    and value
+                )
+                request_outputs = raw_request.get("outputs")
+                if isinstance(request_outputs, dict):
+                    remaining_files.update(
+                        value for value in request_outputs.values()
+                        if isinstance(value, str) and value
+                    )
+            removed_files.difference_update(remaining_files)
+
+            outline["pages"] = pages
+            outline["raw"] = self._outline_raw_without_page(
+                outline.get("raw"), pages, page_index, previous_count
+            )
+            images["generated"] = generated
+            if shifted_errors:
+                images["errors"] = shifted_errors
+            else:
+                images.pop("errors", None)
+            if remaining_requests:
+                images["pattern_requests"] = remaining_requests
+            else:
+                images.pop("pattern_requests", None)
+
+            record["outline"] = outline
+            record["images"] = images
+            record["updated_at"] = datetime.now().isoformat()
+            record["thumbnail"] = HistoryImageMerger.first_image(generated)
+            record["status"] = HistoryImageMerger.compute_status(generated, len(pages))
+
+            # Persist metadata before unlinking files.  If a file is locked or
+            # already missing, the record remains internally consistent and a
+            # later cleanup can safely remove the orphan.
+            self._atomic_write_json(self._get_record_path(record_id), record)
+            index = self._load_index()
+            for index_record in index.get("records", []):
+                if index_record.get("id") != record_id:
+                    continue
+                index_record["updated_at"] = record["updated_at"]
+                index_record["status"] = record["status"]
+                index_record["thumbnail"] = record.get("thumbnail")
+                index_record["page_count"] = len(pages)
+                break
+            self._save_index(index)
+
+            task_id = images.get("task_id")
+            task_dir: Optional[str] = None
+            if isinstance(task_id, str) and task_id and os.path.basename(task_id) == task_id:
+                candidate_dir = os.path.realpath(os.path.join(self.history_dir, task_id))
+                history_root = os.path.realpath(self.history_dir)
+                try:
+                    if os.path.commonpath([history_root, candidate_dir]) == history_root and os.path.isdir(candidate_dir):
+                        task_dir = candidate_dir
+                except ValueError:
+                    task_dir = None
+
+            deleted_files: List[str] = []
+            for filename in sorted(removed_files):
+                asset_path = self._safe_task_asset_path(task_dir, filename)
+                if not asset_path:
+                    continue
+                for path in (asset_path, os.path.join(os.path.dirname(asset_path), f"thumb_{os.path.basename(asset_path)}")):
+                    try:
+                        if os.path.isfile(path):
+                            os.remove(path)
+                            deleted_files.append(os.path.basename(path))
+                    except OSError as exc:
+                        logger.warning("删除历史页面资源失败: %s (%s)", path, exc)
+
+            # Numeric original images are indexed by filename during the
+            # history scanner.  Keep those filenames aligned after removing a
+            # source page, otherwise a later scan could resurrect a deleted
+            # index or duplicate the last image.  Pattern assets use generated
+            # UUID names and are intentionally left untouched.
+            # Removing a pattern page from the middle shifts every following
+            # original image as well, so reindex numeric assets for either page
+            # type (the helper skips UUID-named pattern assets itself).
+            reindexed_generated = self._reindex_numeric_assets(task_dir, generated, pages)
+            if reindexed_generated != generated:
+                generated = reindexed_generated
+                record["images"]["generated"] = generated
+                record["thumbnail"] = HistoryImageMerger.first_image(generated)
+                self._atomic_write_json(self._get_record_path(record_id), record)
+                index = self._load_index()
+                for index_record in index.get("records", []):
+                    if index_record.get("id") == record_id:
+                        index_record["thumbnail"] = record.get("thumbnail")
+                        break
+                self._save_index(index)
+
+            return {
+                "record": record,
+                "page_index": page_index,
+                "deleted_type": target_type,
+                "deleted_files": deleted_files,
+            }
 
     def delete_record(self, record_id: str) -> bool:
         """

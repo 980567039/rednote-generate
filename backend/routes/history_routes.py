@@ -13,8 +13,14 @@ import os
 import io
 import zipfile
 import logging
+import re
 from flask import Blueprint, request, jsonify, send_file
-from backend.services.history import ContentStatus, get_history_service
+from backend.errors import AppError
+from backend.services.history import (
+    ContentStatus,
+    HistoryPageDeletionConflictError,
+    get_history_service,
+)
 from .utils import api_error_response, normalize_error_result, validation_error
 
 logger = logging.getLogger(__name__)
@@ -91,6 +97,10 @@ def create_history_blueprint():
             topic = data.get('topic')
             outline = data.get('outline')
             task_id = data.get('task_id')
+            series_id = data.get('series_id')
+            series_template_id = data.get('series_template_id')
+            series_item_index = data.get('series_item_index')
+            series_item_title = data.get('series_item_title')
 
             if not topic or not outline:
                 return api_error_response(
@@ -99,7 +109,17 @@ def create_history_blueprint():
                 )
 
             history_service = get_history_service()
-            record_id = history_service.create_record(topic, outline, task_id)
+            record_id = history_service.create_record(
+                topic, outline, task_id,
+                series_id=series_id,
+                series_project_id=data.get('series_project_id'),
+                series_template_id=series_template_id,
+                series_item_index=series_item_index,
+                series_item_title=series_item_title,
+                series_item_id=data.get('series_item_id'),
+                series_topic_source=data.get('series_topic_source'),
+                series_content_mode=data.get('content_mode') or data.get('series_content_mode'),
+            )
 
             return jsonify({
                 "success": True,
@@ -287,6 +307,127 @@ def create_history_blueprint():
 
         except Exception as e:
             return api_error_response(e, context={"endpoint": "/api/history/<id>", "record_id": record_id})
+
+    @history_bp.route('/history/<record_id>/pattern-pages', methods=['POST'])
+    def append_pattern_page(record_id):
+        """接收 Perler 母版；只有调用方明确确认后才会写入历史。"""
+        try:
+            request_id = (request.form.get('request_id') or '').strip()
+            if not re.fullmatch(r'[A-Za-z0-9._:-]{1,128}', request_id):
+                return api_error_response(
+                    validation_error("request_id 无效", "请重新发起拼豆图纸交接。"),
+                    context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id},
+                )
+
+            pattern_file = request.files.get('pattern')
+            if not pattern_file or not pattern_file.filename:
+                return api_error_response(
+                    validation_error("缺少 pattern 文件", "请先从 Perler 回传 PNG 母版。"),
+                    context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id},
+                )
+            image_data = pattern_file.read(20 * 1024 * 1024 + 1)
+            if len(image_data) > 20 * 1024 * 1024:
+                return api_error_response(
+                    validation_error("拼豆图纸文件超过 20MB", "请缩小母版后再试。"),
+                    context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id},
+                )
+
+            def read_optional_file(field_name, label, max_bytes):
+                upload = request.files.get(field_name)
+                if not upload or not upload.filename:
+                    return None
+                data = upload.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    raise ValueError(f"{label}文件超过 {max_bytes // (1024 * 1024)}MB")
+                return data
+
+            beads_data = read_optional_file('beads', '拼豆实物效果图', 10 * 1024 * 1024)
+            ironed_data = read_optional_file('ironed', '熨烫成品效果图', 10 * 1024 * 1024)
+
+            def form_int(name, default):
+                raw = request.form.get(name)
+                return default if raw in (None, '') else int(raw)
+
+            result = get_history_service().append_pattern_image(
+                record_id=record_id,
+                request_id=request_id,
+                image_data=image_data,
+                source_image_index=form_int('source_image_index', 0),
+                columns=form_int('columns', 104),
+                rows=form_int('rows', 104),
+                used_colors=form_int('used_colors', 40),
+                beads_data=beads_data,
+                ironed_data=ironed_data,
+            )
+            response_payload = {
+                "success": True,
+                "appended": result["appended"],
+                "page_index": result["page_index"],
+                "filename": result["filename"],
+                "record": result["record"],
+            }
+            if result.get("outputs"):
+                response_payload["outputs"] = result["outputs"]
+            return jsonify(response_payload), 200
+        except (TypeError, ValueError) as exc:
+            return api_error_response(
+                validation_error(str(exc), "拼豆图纸参数或文件无效。"),
+                context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id},
+            )
+        except FileNotFoundError as exc:
+            return api_error_response(str(exc), status=404, context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id})
+        except Exception as exc:
+            return api_error_response(exc, context={"endpoint": "/api/history/<id>/pattern-pages", "record_id": record_id})
+
+    @history_bp.route('/history/<record_id>/pages/<int:page_index>', methods=['DELETE'])
+    @history_bp.route('/history/<record_id>/pattern-pages/<int:page_index>', methods=['DELETE'])
+    def delete_history_page(record_id, page_index):
+        """删除单页及其关联资源。
+
+        ``pages`` 是通用入口，允许删除原始图片或追加的拼豆图纸；后者
+        会同时清理 beads/ironed 附属输出。保留 ``pattern-pages`` 别名，
+        方便旧客户端按追加图纸的语义调用同一套安全校验。
+        """
+        context = {
+            "endpoint": "/api/history/<id>/pages/<page_index>",
+            "record_id": record_id,
+            "page_index": page_index,
+        }
+        try:
+            result = get_history_service().delete_page(record_id, page_index)
+            return jsonify({
+                "success": True,
+                "page_index": result["page_index"],
+                "deleted_type": result.get("deleted_type"),
+                "deleted_files": result.get("deleted_files", []),
+                "record": result["record"],
+            }), 200
+        except HistoryPageDeletionConflictError as exc:
+            suggestion = (
+                "请等待图片任务结束后再删除页面。"
+                if "仍在生成" in str(exc)
+                else "请先删除关联的拼豆图纸，再删除来源图片。"
+            )
+            return api_error_response(
+                AppError(
+                    code="PAGE_DELETE_CONFLICT",
+                    title="页面无法删除",
+                    detail=str(exc),
+                    suggestion=suggestion,
+                    status=409,
+                    retryable=False,
+                ),
+                context=context,
+            )
+        except (TypeError, ValueError) as exc:
+            return api_error_response(
+                validation_error(str(exc), "请检查要删除的页面后重试。"),
+                context=context,
+            )
+        except FileNotFoundError as exc:
+            return api_error_response(str(exc), status=404, context=context)
+        except Exception as exc:
+            return api_error_response(exc, context=context)
 
     @history_bp.route('/history/<record_id>', methods=['DELETE'])
     def delete_history(record_id):

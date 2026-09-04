@@ -132,11 +132,28 @@ class OutlineService:
     def generate_outline(
         self,
         topic: str,
-        images: Optional[List[bytes]] = None
+        images: Optional[List[bytes]] = None,
+        series_context: str = "",
+        series_template: Optional[Dict[str, Any]] = None,
+        series_template_id: Optional[str] = None,
+        series_item_index: Optional[int] = None,
+        series_item_title: Optional[str] = None,
+        **_: Any,
     ) -> Dict[str, Any]:
         try:
             logger.info(f"开始生成大纲: topic={topic[:50]}..., images={len(images) if images else 0}")
             prompt = self.prompt_template.format(topic=topic)
+
+            if series_context:
+                prompt += (
+                    "\n\n" + series_context +
+                    "\n【系列大纲校验要求】严格按固定页面数量和页面类型输出；子主题只能补充剧情和场景，"
+                    "不得改变系列画风、色板、角色设定、文案口吻或禁用项。"
+                )
+            elif series_template:
+                # 兼容直接传模板对象的调用方。
+                from backend.services.series import build_context
+                prompt += "\n\n" + build_context(series_template, series_item_title or topic, series_item_index)["series_context"]
 
             if images and len(images) > 0:
                 prompt += f"\n\n注意：用户提供了 {len(images)} 张参考图片，请在生成大纲时考虑这些图片的内容和风格。这些图片可能是产品图、个人照片或场景图，请根据图片内容来优化大纲，使生成的内容与图片相关联。"

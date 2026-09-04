@@ -12,7 +12,7 @@
 
         <div v-if="initializing" class="initializing" role="status">
           <span class="modal-spinner" aria-hidden="true"></span>
-          正在读取发布配置并检查登录状态…
+          正在读取发布配置…
         </div>
 
         <template v-else>
@@ -42,7 +42,7 @@
                 v-if="loggedIn !== true"
                 class="btn btn-secondary compact-button"
                 type="button"
-                :disabled="openingLogin || !publisherAvailable"
+                :disabled="checkingLogin || openingLogin || !publisherAvailable"
                 @click="openLogin"
               >
                 {{ openingLogin ? '打开中…' : '打开登录页' }}
@@ -189,8 +189,8 @@
               >
                 {{ task.status === 'auth_required' ? '登录后返回编辑并重建任务' : '返回编辑' }}
               </button>
-              <button class="btn btn-primary" type="button" @click="close">
-                {{ isTerminal ? '完成' : '关闭并在后台继续' }}
+              <button class="btn btn-primary" type="button" :disabled="cancelling" @click="close">
+                {{ cancelling ? '正在停止…' : isTerminal ? '完成' : '停止任务并关闭' }}
               </button>
             </footer>
           </div>
@@ -204,6 +204,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   checkPublishLogin,
+  cancelPublishTask,
   confirmPublishTask,
   createPublishTask,
   getPublishConfig,
@@ -242,10 +243,12 @@ const openingLogin = ref(false)
 const loginMessage = ref('尚未检查登录状态。')
 const submitting = ref(false)
 const confirming = ref(false)
+const cancelling = ref(false)
 const task = ref<PublishTask | null>(null)
 const error = ref<AppError | null>(null)
 let pollTimer: number | null = null
 let pollInFlight = false
+let lifecycleVersion = 0
 
 const stages: Array<{ status: PublishTaskStatus; label: string }> = [
   { status: 'queued', label: '任务排队' },
@@ -259,7 +262,18 @@ const stages: Array<{ status: PublishTaskStatus; label: string }> = [
   { status: 'published', label: '发布完成' }
 ]
 
-const terminalStatuses = new Set<PublishTaskStatus>(['published', 'submitted', 'failed', 'unknown', 'auth_required'])
+const terminalStatuses = new Set<PublishTaskStatus>(['published', 'submitted', 'failed', 'unknown', 'auth_required', 'cancelled'])
+const cancellableStatuses = new Set<PublishTaskStatus>([
+  'queued',
+  'validating',
+  'checking_auth',
+  'launching_browser',
+  'opening_browser',
+  'uploading',
+  'filling',
+  'ready_for_review',
+  'submitting'
+])
 
 const parsedTags = computed(() => editableTags.value
   .split(/[\s,，]+/)
@@ -314,7 +328,8 @@ const statusTitle = computed(() => {
     submitted: '已提交，等待平台确认',
     published: '发布成功',
     failed: '发布失败',
-    unknown: '发布结果未知'
+    unknown: '发布结果未知',
+    cancelled: '发布任务已停止'
   }
   return task.value ? labels[task.value.status] || '正在处理发布任务' : ''
 })
@@ -328,7 +343,8 @@ const statusDescription = computed(() => {
     submitted: '操作已提交，但尚未取得平台最终成功凭据，请到小红书确认。',
     published: '平台已确认发布成功。',
     failed: '任务已停止，不会自动重试，避免重复发布。',
-    unknown: '无法判断是否发布成功，请先到小红书检查，勿立即重试。'
+    unknown: '无法判断是否发布成功，请先到小红书检查，勿立即重试。',
+    cancelled: '本机发布进程已停止，未进入平台提交阶段。'
   }
   return descriptions[task.value.status] || '发布助手正在执行，请保持浏览器开启。'
 })
@@ -349,37 +365,54 @@ function resetForm() {
 }
 
 async function initialize() {
+  const requestVersion = ++lifecycleVersion
   stopPolling()
+  pollInFlight = false
+  checkingLogin.value = false
+  openingLogin.value = false
+  cancelling.value = false
   resetForm()
   publisherAvailable.value = false
   initializing.value = true
   try {
     const result = await getPublishConfig()
-    if (!props.visible) return
+    if (!isCurrentLifecycle(requestVersion)) return
     if (!result.success || !result.config) {
       error.value = normalizeApiError(result.error || result.error_message || '读取发布配置失败', '读取发布配置失败')
       return
     }
     publisherAvailable.value = result.config.publisher_available
     mode.value = result.config.default_mode || 'preview'
-    await restoreRememberedTask()
+    await restoreRememberedTask(requestVersion)
+    if (!isCurrentLifecycle(requestVersion)) return
     if (!publisherAvailable.value) {
       loginMessage.value = '本机发布助手不可用，请到系统设置检查发布器目录。'
       loggedIn.value = false
       return
     }
-    if (!task.value || task.value.status === 'auth_required') await checkLogin()
   } finally {
-    if (props.visible) initializing.value = false
+    if (isCurrentLifecycle(requestVersion)) {
+      initializing.value = false
+      if (publisherAvailable.value && (!task.value || task.value.status === 'auth_required')) {
+        void checkLoginForLifecycle(requestVersion)
+      }
+    }
   }
 }
 
 async function checkLogin() {
+  await checkLoginForLifecycle(lifecycleVersion)
+}
+
+async function checkLoginForLifecycle(requestVersion: number) {
+  if (!isCurrentLifecycle(requestVersion) || checkingLogin.value) return
   checkingLogin.value = true
+  loginMessage.value = '正在检查小红书登录状态…'
   try {
     const result = await checkPublishLogin()
-    if (!props.visible) return
+    if (!isCurrentLifecycle(requestVersion)) return
     if (result.success) {
+      error.value = null
       loggedIn.value = result.logged_in === true || result.authenticated === true
       loginMessage.value = result.message || (loggedIn.value ? '已登录，可以开始发布。' : '当前未登录，请打开登录页扫码。')
     } else {
@@ -388,23 +421,30 @@ async function checkLogin() {
       error.value = normalizeApiError(result.error || result.error_message || '检查登录状态失败', '检查登录状态失败')
     }
   } finally {
-    checkingLogin.value = false
+    if (isCurrentLifecycle(requestVersion)) checkingLogin.value = false
   }
 }
 
 async function openLogin() {
+  const requestVersion = lifecycleVersion
+  if (!isCurrentLifecycle(requestVersion) || checkingLogin.value || openingLogin.value) return
   openingLogin.value = true
   error.value = null
+  loginMessage.value = '正在唤起 Chrome 登录页，首次启动可能需要十几秒，请勿重复点击。'
   try {
     const result = await openPublishLogin()
-    if (!props.visible) return
+    if (!isCurrentLifecycle(requestVersion)) return
     if (result.success) {
+      error.value = null
+      if (result.logged_in !== undefined || result.authenticated !== undefined) {
+        loggedIn.value = result.logged_in === true || result.authenticated === true
+      }
       loginMessage.value = result.message || (result.login_started ? '登录页已打开，请在浏览器完成登录后重新检查。' : '请在浏览器完成登录后重新检查。')
     } else {
       error.value = normalizeApiError(result.error || result.error_message || '打开登录页失败', '打开登录页失败')
     }
   } finally {
-    openingLogin.value = false
+    if (isCurrentLifecycle(requestVersion)) openingLogin.value = false
   }
 }
 
@@ -439,10 +479,11 @@ function schedulePoll(delay = 1000) {
 
 async function pollTask() {
   if (!props.visible || !task.value || pollInFlight) return
+  const requestVersion = lifecycleVersion
   pollInFlight = true
   try {
     const result = await getPublishTask(task.value.id)
-    if (!props.visible || !task.value) return
+    if (!isCurrentLifecycle(requestVersion) || !task.value) return
     if (result.success && result.task) {
       task.value = result.task
       handleTaskState()
@@ -451,7 +492,7 @@ async function pollTask() {
     error.value = normalizeApiError(result.error || result.error_message || '刷新发布状态失败', '刷新发布状态失败')
     schedulePoll(3000)
   } finally {
-    pollInFlight = false
+    if (requestVersion === lifecycleVersion) pollInFlight = false
   }
 }
 
@@ -534,11 +575,12 @@ function forgetTask() {
   if (props.recordId) localStorage.removeItem(taskStorageKey())
 }
 
-async function restoreRememberedTask() {
+async function restoreRememberedTask(requestVersion: number) {
   if (!props.recordId) return
   const taskId = localStorage.getItem(taskStorageKey())
   if (!taskId) return
   const result = await getPublishTask(taskId)
+  if (!isCurrentLifecycle(requestVersion)) return
   if (result.success && result.task) {
     task.value = result.task
     if (result.task.mode) mode.value = result.task.mode
@@ -553,6 +595,10 @@ async function restoreRememberedTask() {
   error.value = restoreError
 }
 
+function isCurrentLifecycle(version: number) {
+  return props.visible && version === lifecycleVersion
+}
+
 function stopPolling() {
   if (pollTimer !== null) {
     window.clearTimeout(pollTimer)
@@ -560,8 +606,29 @@ function stopPolling() {
   }
 }
 
-function close() {
+async function close() {
+  const requestVersion = lifecycleVersion
+  const currentTask = task.value
+  if (currentTask && cancellableStatuses.has(currentTask.status) && !cancelling.value) {
+    cancelling.value = true
+    error.value = null
+    const result = await cancelPublishTask(currentTask.id)
+    if (!isCurrentLifecycle(requestVersion)) return
+    if (!result.success) {
+      cancelling.value = false
+      error.value = normalizeApiError(result.error || result.error_message || '停止发布任务失败', '停止发布任务失败')
+      return
+    }
+    if (result.task) task.value = result.task
+    cancelling.value = false
+  }
+  lifecycleVersion += 1
   stopPolling()
+  pollInFlight = false
+  checkingLogin.value = false
+  openingLogin.value = false
+  cancelling.value = false
+  initializing.value = false
   emit('close')
 }
 
@@ -571,7 +638,15 @@ function handleKeydown(event: KeyboardEvent) {
 
 watch(() => props.visible, visible => {
   if (visible) void initialize()
-  else stopPolling()
+  else {
+    lifecycleVersion += 1
+    stopPolling()
+    pollInFlight = false
+    checkingLogin.value = false
+    openingLogin.value = false
+    cancelling.value = false
+    initializing.value = false
+  }
 })
 
 onMounted(() => window.addEventListener('keydown', handleKeydown))

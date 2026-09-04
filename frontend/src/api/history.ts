@@ -7,6 +7,7 @@ import type {
   HistoryDetail,
   HistoryRecord,
   Page,
+  SeriesRequestContext,
   UpdateHistoryParams
 } from './types'
 import type { AppError } from '../utils/errors'
@@ -14,7 +15,8 @@ import type { AppError } from '../utils/errors'
 export async function createHistory(
   topic: string,
   outline: { raw: string; pages: Page[] },
-  taskId?: string
+  taskId?: string,
+  series?: SeriesRequestContext
 ): Promise<{ success: boolean; record_id?: string; error?: AppError | string; error_message?: string }> {
   try {
     const response = await axios.post(
@@ -22,7 +24,8 @@ export async function createHistory(
       {
         topic,
         outline,
-        task_id: taskId
+        task_id: taskId,
+        ...(series || {})
       },
       {
         timeout: 10000
@@ -101,6 +104,76 @@ export async function updateHistory(
     return response.data
   } catch (error: any) {
     return { success: false, ...getApiErrorPayload(error, '更新历史记录失败') }
+  }
+}
+
+export async function appendPatternPage(
+  recordId: string,
+  input: {
+    requestId: string
+    sourceImageIndex: number
+    columns: number
+    rows: number
+    usedColors: number
+    pattern: Blob
+    beads?: Blob
+    ironed?: Blob
+  }
+): Promise<{
+  success: boolean
+  appended?: boolean
+  page_index?: number
+  filename?: string
+  outputs?: {
+    beads?: string
+    ironed?: string
+  }
+  record?: HistoryDetail
+  error?: AppError | string
+  error_message?: string
+}> {
+  const formData = new FormData()
+  formData.append('request_id', input.requestId)
+  formData.append('source_image_index', String(input.sourceImageIndex))
+  formData.append('columns', String(input.columns))
+  formData.append('rows', String(input.rows))
+  formData.append('used_colors', String(input.usedColors))
+  formData.append('pattern', input.pattern, 'perler-master.png')
+  if (input.beads) formData.append('beads', input.beads, 'perler-beads.png')
+  if (input.ironed) formData.append('ironed', input.ironed, 'perler-ironed.png')
+  try {
+    const response = await axios.post(
+      `${API_BASE_URL}/history/${encodeURIComponent(recordId)}/pattern-pages`,
+      formData,
+      { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 60000 }
+    )
+    return response.data
+  } catch (error: any) {
+    return { success: false, ...getApiErrorPayload(error, '追加拼豆图纸失败') }
+  }
+}
+
+/** 删除历史记录中的单个页面（原始图片或追加的拼豆图纸）。 */
+export async function deleteHistoryPage(
+  recordId: string,
+  pageIndex: number,
+): Promise<{
+  success: boolean
+  page_index?: number
+  deleted_type?: string
+  deleted_files?: string[]
+  record?: HistoryDetail
+  error?: AppError | string
+  error_message?: string
+}> {
+  try {
+    const response = await axios.delete(
+      `${API_BASE_URL}/history/${encodeURIComponent(recordId)}/pages/${encodeURIComponent(String(pageIndex))}`,
+      { timeout: 10000 },
+    )
+    return response.data
+  } catch (error: any) {
+    return { success: false, ...getApiErrorPayload(error, '删除页面失败') }
   }
 }
 
